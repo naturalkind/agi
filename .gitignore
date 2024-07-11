@@ -1,0 +1,9 @@
+__pycache__
+venv
+Mistral-7B-Instruct-v0.2
+mamba-minimal
+ssl
+text-generation-webui
+YOURPRIVATE.key
+YOURPUBLIC.pem
+._mistral-7B-v0.1
