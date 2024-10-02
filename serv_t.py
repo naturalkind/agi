@@ -1,3 +1,267 @@
+## -*- coding: utf-8 -*-
+#import tornado.httpserver
+#import tornado.ioloop
+#import tornado.web
+#import ssl
+#import json
+#import time
+#import requests
+#import numpy as np
+#import cv2
+#import random
+#import os
+#import sys
+#import logging
+#import certifi
+#from io import StringIO
+#from fake_useragent import UserAgent
+#from multiprocessing import Process, Queue
+#import uuid
+#import zlib
+#import pickle
+#import zmq
+#import zmq.asyncio
+#from zmq.asyncio import Context
+#from md2tgmd import escape
+#import markdown2
+#import re
+#from bs4 import BeautifulSoup
+
+## Настройка логирования
+#logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+#logger = logging.getLogger(__name__)
+
+## Константы
+#TOPIC = 'snaptravel'
+#RECEIVE_PORT = 5555
+#SEND_PORT = 5556
+
+## Загрузка данных конфигурации из JSON файла
+#with open('config.bot', 'r') as json_file:
+#    data = json.load(json_file)
+#ACC_KEY = data['BOT_TOKEN']  # Замените на ваш токен
+
+## Функции для работы с ZeroMQ
+#def compress(obj):
+#    return zlib.compress(pickle.dumps(obj))
+
+#def decompress(pickled):
+#    return pickle.loads(zlib.decompress(pickled))
+
+#def start_zmq():
+#    global work_publisher
+#    context = zmq.Context()
+#    work_publisher = context.socket(zmq.PUB)
+#    work_publisher.connect(f'tcp://127.0.0.1:{SEND_PORT}')
+
+#def send_zmq(args, model=None, topic=TOPIC):
+#    id = str(uuid.uuid4())
+#    message = {'body': args["title"], 'model': model, 'id': id}
+#    compressed_message = compress(message)
+#    work_publisher.send(f'{topic} '.encode('utf8') + compressed_message)
+#    return id
+
+#def get_zmq(id, topic=TOPIC):
+#    context = zmq.Context()
+#    result_subscriber = context.socket(zmq.SUB)
+#    result_subscriber.setsockopt(zmq.SUBSCRIBE, topic.encode('utf8'))
+#    result_subscriber.connect(f'tcp://127.0.0.1:{RECEIVE_PORT}')
+#    while True:
+#        result = decompress(result_subscriber.recv()[len(topic) + 1:])
+#        if result['id'] == id:
+#            result_subscriber.close()
+#            if result.get('error'):
+#                raise Exception(result['error_msg'])
+#            return result
+
+#def send_and_get(args, model=None):
+#    id = send_zmq(args, model=model)
+#    return get_zmq(id)
+
+## Вспомогательные функции
+#def split_text_into_chunks(text, chunk_size):
+#    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+#def extract_special_chars(markdown_text):
+#    md = markdown2.Markdown()
+#    html = md.convert(markdown_text)
+#    special_chars_pattern = re.compile(r'[^\w \t ()<>+!?.,;:\"\-_@{}=]')
+#    return special_chars_pattern.findall(markdown_text)
+
+## Класс для работы с HTTP-запросами
+#class RequestLib:
+#    def __init__(self):
+#        self.session = requests.session()
+#        self.session.proxies = {}
+#        self.headers = {
+#            'User-agent': UserAgent().random,
+#            'Accept-Language': "en,en-US;q=0,5",
+#            'Content-Type': "application/x-www-form-urlencoded",
+#            'Connection': "keep-alive",
+#            'Accept': "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+#        }
+
+#    def get(self, url, proxy=False):
+#        return self.session.get(url, headers=self.headers)
+
+#    def post(self, url, json_data):
+#        return self.session.post(url, json=json_data, headers=self.headers)
+
+## Инициализация HTTP-сессии
+#sess = RequestLib()
+
+## Класс для работы с очередью задач
+#class SerializedWorker:
+#    def __init__(self):
+#        self.q = Queue()
+#        self.p = Process(target=self.forked_process, args=(self.q,))
+#        self.p.start()
+
+#    def forked_process(self, q):
+#        start_zmq()
+#        while True:
+#            work = q.get()
+#            try:
+#                _temp_dict = {"title": work[0] + " ответ на русском"}
+#                logger.info(f"Processing: {work}")
+#                answer = send_and_get(_temp_dict, model='Kandinsky-2.0')
+#                text = answer['prediction']
+#                text_parse = escape(text)
+
+#                if len(text_parse) < 4000:
+#                    self.send_message(work[1], text_parse, work[2])
+#                else:
+#                    self.send_large_message(work[1], text, work[2])
+#            except Exception as e:
+#                logger.error(f"Error processing message: {e}")
+
+#    def send_message(self, chat_id, text, reply_to_message_id=None):
+#        if not text:
+#            logger.error("Attempted to send empty message")
+#            return
+
+#        code_context = {
+#            "chat_id": chat_id,
+#            "text": text,
+#            "parse_mode": "MarkdownV2"
+#        }
+
+#        # Добавляем reply_to_message_id только если он предоставлен
+#        if reply_to_message_id:
+#            code_context["reply_to_message_id"] = reply_to_message_id
+
+#        # Экранируем специальные символы для MarkdownV2
+#        escaped_text = self.escape_markdown(text)
+#        code_context["text"] = escaped_text
+
+#        try:
+#            response = sess.post(f"https://api.telegram.org/bot{ACC_KEY}/sendMessage", code_context)
+#            response.raise_for_status()  # Вызовет исключение для неуспешных статус-кодов
+#            logger.info(f"Message sent successfully: {response.json()}")
+#        except requests.exceptions.RequestException as e:
+#            logger.error(f"Failed to send message: {e}")
+#            if response:
+#                logger.error(f"Response: {response.text}")
+
+#    def escape_markdown(self, text):
+#        """Экранирование специальных символов для MarkdownV2."""
+#        escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+#        return ''.join('\\' + char if char in escape_chars else char for char in text)
+
+#    def send_large_message(self, chat_id, text, reply_to_message_id):
+#        self.send_message(chat_id, "Ответ слишком большой, поэтому сохраняю в отдельный файл:", reply_to_message_id)
+#        file = StringIO(text)
+#        url = f"https://api.telegram.org/bot{ACC_KEY}/sendDocument"
+#        files = {"document": file}
+#        data = {"chat_id": chat_id}
+#        response = requests.post(url, files=files, data=data)
+#        logger.info(f"Large message sent as file: {response.json()}")
+
+#    def queue_work(self, text):
+#        self.q.put(text)
+
+## Обработчик Tornado для входящих сообщений
+#class MessageHandler(tornado.web.RequestHandler):
+#    def initialize(self, worker):
+#        self.worker = worker
+#    def get(self):
+#        print ("GET-------------->")
+#    def post(self):
+#        print("POST-------------->", self.request, self.request.body)
+#        try:
+#            data = json.loads(self.request.body)
+#            
+#            # Проверяем, есть ли ключ 'message' в данных
+#            if 'message' not in data:
+#                logger.warning("Received update without 'message' key")
+#                return
+
+#            message = data['message']
+#            chat_id = message['chat']['id']
+#            
+#            # Проверяем наличие текста в сообщении
+#            if 'text' not in message:
+#                logger.warning(f"Received message without text for chat_id {chat_id}")
+#                return
+
+#            text_mess = message['text']
+#            mess_id = message['message_id']
+
+#            print(f"Received message: {text_mess} from chat_id: {chat_id}")
+
+#            if text_mess.strip().lower() == "/start":
+#                welcome_message = "Добрый день, я помощник @naturalkind. Вы можете задать мне любой вопрос, и я постараюсь вам помочь."
+#                self.send_message(chat_id, welcome_message)
+#                logger.info(f"Sent welcome message to chat_id {chat_id}")
+#            elif text_mess:
+#                self.worker.queue_work([text_mess, str(chat_id), str(mess_id)])
+#                self.send_typing_action(chat_id)
+#                logger.info(f"Queued work for message: {text_mess[:20]}... from chat_id {chat_id}")
+#        except json.JSONDecodeError:
+#            logger.error("Failed to decode JSON from request body")
+#        except KeyError as e:
+#            logger.error(f"KeyError in message processing: {e}")
+#        except Exception as e:
+#            logger.error(f"Unexpected error: {e}")
+
+#    def send_message(self, chat_id, text):
+#        url = f"https://api.telegram.org/bot{ACC_KEY}/sendMessage"
+#        payload = {
+#            "chat_id": chat_id,
+#            "text": text,
+#            "parse_mode": "HTML"
+#        }
+#        response = requests.post(url, json=payload)
+#        if response.status_code != 200:
+#            logger.error(f"Failed to send message. Status code: {response.status_code}, Response: {response.text}")
+
+#    def send_typing_action(self, chat_id):
+#        url = f"https://api.telegram.org/bot{ACC_KEY}/sendChatAction?chat_id={chat_id}&action=typing"
+#        sess.get(url)
+
+#if __name__ == '__main__':
+#    worker = SerializedWorker()
+#    application = tornado.web.Application([
+#        (r'/', MessageHandler, dict(worker=worker)),
+#    ])
+
+#    http_server = tornado.httpserver.HTTPServer(
+#        application,
+#        ssl_options={
+#            "certfile": "YOURPUBLIC.pem",
+#            "keyfile": "YOURPRIVATE.key",
+#            "ssl_version": ssl.PROTOCOL_TLSv1_2
+#        }
+#    )
+
+#    port = 8443  # Выберите подходящий порт
+#    http_server.listen(port)
+#    logger.info(f"Server started on port {port}")
+#    tornado.ioloop.IOLoop.current().start()
+
+
+
+
 # -*- coding: utf-8 -*-
 from fake_useragent import UserAgent
 import tornado.httpserver
@@ -14,7 +278,9 @@ import os
 import sys
 import certifi
 from io import StringIO
-
+import markdown2
+import re
+from bs4 import BeautifulSoup
 
 # CLIENT
 import uuid
@@ -94,9 +360,6 @@ def split_text_into_chunks(text, chunk_size):
 
     return chunks
 
-import markdown2
-import re
-from bs4 import BeautifulSoup
 
 def extract_special_chars(markdown_text):
     md = markdown2.Markdown()
@@ -193,7 +456,10 @@ class RequestLib(object):
         return get_page
             
 sess = RequestLib()
-acc_key = "1227859397:AAHMyk5SibE7WXo4kYc78nxCjTyCOHxQdVk"
+with open('config.bot', 'r') as json_file:
+    data = json.load(json_file)
+    
+acc_key = data['BOT_TOKEN']
 
 
 class getToken(tornado.web.RequestHandler):
@@ -232,6 +498,15 @@ class getToken(tornado.web.RequestHandler):
 
             #--------------------->
     #        print ("POST", chat_id, data)
+            if text_mess.strip().lower() == "/start":
+                welcome_message = "Добрый день, я помощник @naturalkind. Вы можете задать мне любой вопрос, и я постараюсь вам помочь."
+                url = f"https://api.telegram.org/bot{acc_key}/sendMessage"
+                payload = {
+                    "chat_id": chat_id,
+                    "text": welcome_message,
+                    "parse_mode": "HTML"
+                }
+                response = sess.session.post(url, json=payload)
             if text_mess != "":
                 self.worker.queue_work([text_mess, str(chat_id), str(mess_id)])
 #                url = "https://api.telegram.org/bot"+acc_key+"/sendMessage?chat_id="+str(chat_id)+"&text="+"скоро отвечу"+"&parse_mode=html"
@@ -261,26 +536,26 @@ if __name__ == '__main__':
 #    
     
     
-###
+##
 
 
 
-#class MainHandler(tornado.web.RequestHandler):
-#  def initialize(self, worker):
-#    self.worker = worker
+class MainHandler(tornado.web.RequestHandler):
+  def initialize(self, worker):
+    self.worker = worker
 
-#  def get(self):
-#    self.worker.queue_work()
-#    self.write("Queued processing of %d\n" % worker.counter)
+  def get(self):
+    self.worker.queue_work()
+    self.write("Queued processing of %d\n" % worker.counter)
 
 
-#if __name__ == "__main__":
-#  worker = SerializedWorker()
-#  application = tornado.web.Application([
-#    (r"/", MainHandler, dict(worker=worker)),
-#  ])
-#  application.listen(8888)
-#  tornado.ioloop.IOLoop.instance().start()
+if __name__ == "__main__":
+  worker = SerializedWorker()
+  application = tornado.web.Application([
+    (r"/", MainHandler, dict(worker=worker)),
+  ])
+  application.listen(8888)
+  tornado.ioloop.IOLoop.instance().start()
 
 
 

@@ -11,7 +11,7 @@ import requests
 #5 python3 _bot.py
 
 #openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout ssl/cert.key -out ssl/cert.crt
-acc_key = "1227859397:AAHMyk5SibE7WXo4kYc78nxCjTyCOHxQdVk" 
+acc_key = "1227859397:AAH1TQc069YNhNUQ4RiOeJtS-CHI6qbEfDM" 
 files = {'certificate': open('YOURPUBLIC.pem', 'rb')}
 
 ##------------------------->
