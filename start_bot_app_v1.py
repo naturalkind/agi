@@ -131,11 +131,11 @@ def synthesize_speech(text, model, config, user_id):
     return wav_path    
 
 
-def pipeline_worker():
+async def pipeline_worker():
     from TTS.tts.configs.xtts_config import XttsConfig
     from TTS.tts.models.xtts import Xtts
 
-    context = zmq.Context()
+    context = zmq.asyncio.Context()
     receiver = context.socket(zmq.PULL)
     receiver.bind(ZMQ_PIPELINE_ADDRESS)
 
@@ -193,25 +193,38 @@ def pipeline_worker():
     xtts_model.load_checkpoint(xtts_config, checkpoint_dir="/media/sadko/1b32d2c7-3fcf-4c94-ad20-4fb130a7a7d4/PLAYGROUND/LLM/XTTS-v2/", eval=True)
     xtts_model.cuda()
     
+    async def send_status_update(chat_id, message_id, status):
+        await sender.send(compress({
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'status': status,
+            'type': 'status_update'
+        }))
+    
     while True:
         try:
-            message = decompress(receiver.recv())
+            message = decompress(await receiver.recv())
             chat_id = message['chat_id']
             user_id = message['user_id'] 
             message_id = message['message_id']
             message_type = message['type']
+
             if message_type == 'text':
                 text = message['text']
+                await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
             elif message_type == 'voice':
                 audio_content = message['audio_content']
-                # Convert audio content to text using Whisper
+                await send_status_update(chat_id, message_id, "🎙️ Обработка голоса...")
                 result = whisper_pipe(audio_content)
                 torch.cuda.empty_cache()
                 text = result["text"]
+                await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
             elif message_type == 'file':
                 text = message['text']
+                await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
             else:
                 continue  # Skip unsupported message types
+
             # Получаем историю диалога из базы данных
             cursor.execute('SELECT message, role FROM dialogs WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 5', (chat_id,))
             history = cursor.fetchall()
@@ -219,22 +232,21 @@ def pipeline_worker():
             messages = [{"role": role, "content": msg} for msg, role in history]
             messages.append({"role": "user", "content": text})
 
+            await send_status_update(chat_id, message_id, "🧠 Генерация ответа...")
             output = pipe(messages, **generation_args)
             response = output[0]['generated_text']
             
             torch.cuda.empty_cache()
             
-            #if message_type == 'tts':
             if message_type == 'voice':
+                await send_status_update(chat_id, message_id, "🔊 Синтез речи...")
                 # Generate speech using XTTS
                 output_path = synthesize_speech(response, xtts_model, xtts_config, user_id)
                 response = f"Перевод: {text} Ответ: {response}"
                 with open(output_path, 'rb') as audio_file:
                     audio_content = audio_file.read()
                 
-#                os.remove(output_path)  # Clean up temporary file
-                
-                sender.send(compress({
+                await sender.send(compress({
                     'chat_id': chat_id,
                     'audio': audio_content,
                     'text': response,
@@ -242,13 +254,12 @@ def pipeline_worker():
                     'type': 'voice'
                 }))
             else:
-                sender.send(compress({
+                await sender.send(compress({
                     'chat_id': chat_id,
                     'text': response,
                     'message_id': message_id,
                     'type': 'text'
                 }))
-            
             
             # Очищаем кэш CUDA после каждой обработки
             torch.cuda.empty_cache()
@@ -257,8 +268,9 @@ def pipeline_worker():
             torch.cuda.empty_cache()
             logger.error(f"Error in pipeline worker: {e}")
 
+# Функция для запуска pipeline_worker
 def start_pipeline_worker():
-    Process(target=pipeline_worker).start()
+    asyncio.run(pipeline_worker())
 
 def save_message_to_db(chat_id, message, role):
     cursor.execute('''
@@ -513,32 +525,93 @@ async def send_voice(chat_id, message_id, audio_content):
             if response.status != 200:
                 logger.error(f"Failed to send voice message. Status code: {response.status}")
 
+async def edit_message(chat_id, message_id, new_text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": new_text
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=data) as response:
+            if response.status != 200:
+                logger.error(f"Failed to edit message. Status code: {response.status}")
+
+async def delete_message(chat_id, message_id):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=data) as response:
+            if response.status != 200:
+                logger.error(f"Failed to delete message. Status code: {response.status}")
+
+async def send_status_message(chat_id, reply_to_message_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_to_message_id": reply_to_message_id
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=data) as response:
+            if response.status == 200:
+                return (await response.json())['result']['message_id']
+            else:
+                logger.error(f"Failed to send status message. Status code: {response.status}")
+                return None
 
 async def process_responses(receiver, send_message_func):
+    status_messages = {}  # Словарь для хранения ID сообщений статуса
+
+    async def update_status_message(chat_id, message_id, status):
+        if (chat_id, message_id) in status_messages:
+            status_message_id = status_messages[(chat_id, message_id)]
+            await edit_message(chat_id, status_message_id, status)
+        else:
+            status_message_id = await send_status_message(chat_id, message_id, status)
+            status_messages[(chat_id, message_id)] = status_message_id
+
+    async def delete_status_message(chat_id, message_id):
+        if (chat_id, message_id) in status_messages:
+            status_message_id = status_messages[(chat_id, message_id)]
+            await delete_message(chat_id, status_message_id)
+            del status_messages[(chat_id, message_id)]
+
     while True:
-#        try:
+        try:
             response = await receiver.recv()
             response = decompress(response)
             chat_id = response['chat_id']
-            processed_text = response['text']
             message_id = response['message_id']
-            input_type = response.get('type', 'text')
             
-            if input_type == 'voice':
-                audio = response['audio']
-                await send_voice(chat_id, message_id, audio)
-            
-            save_message_to_db(chat_id, processed_text, "assistant")
-            cache_response(processed_text, processed_text)
-            
-            await send_message_func(chat_id, message_id, processed_text)
-#        except Exception as e:
-#            logger.error(f"Error processing response: {e}")
-            await asyncio.sleep(0.1)
+            if response['type'] == 'status_update':
+                await update_status_message(chat_id, message_id, response['status'])
+            else:
+                processed_text = response['text']
+                input_type = response.get('type', 'text')
+                
+                if input_type == 'voice':
+                    audio = response['audio']
+                    await send_voice(chat_id, message_id, audio)
+                
+                save_message_to_db(chat_id, processed_text, "assistant")
+                cache_response(processed_text, processed_text)
+                
+                await send_message_func(chat_id, message_id, processed_text)
+                await delete_status_message(chat_id, message_id)
+
+        except Exception as e:
+            logger.error(f"Error processing response: {e}")
+        
+        await asyncio.sleep(0.1)
         
         
 def main():
-    start_pipeline_worker()
+    # Запускаем pipeline_worker в отдельном процессе
+    Process(target=start_pipeline_worker).start()
 
     zmq_context = Context.instance()
     sender = zmq_context.socket(zmq.PUSH)
