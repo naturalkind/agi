@@ -314,9 +314,13 @@ class MessageHandler(tornado.web.RequestHandler):
             data = json.loads(self.request.body)
             message = data['message']
             chat_id = message['chat']['id']
-            user_id = message['from']['username']
             message_id = message["message_id"]
             
+            if 'username' in message['from']:
+                user_id =  message['from']['username']
+            else:
+                user_id = message['from']['id'] 
+                
             # Create a unique key for each user in each chat
             unique_key = f"{chat_id}:{message_id}"
                      
@@ -649,3 +653,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
+    
+#{'update_id': 73262880, 'message': {'message_id': 3918, 'from': {'id': 7120275398, 'is_bot': False, 'first_name': 'John', 'last_name': 'Ducker', 'language_code': 'ru'}, 'chat': {'id': 7120275398, 'first_name': 'John', 'last_name': 'Ducker', 'type': 'private'}, 'date': 1729949003, 'text': '/start', 'entities': [{'offset': 0, 'length': 6, 'type': 'bot_command'}]}}    
