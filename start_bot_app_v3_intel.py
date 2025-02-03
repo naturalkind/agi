@@ -29,6 +29,8 @@ import numpy as np
 import librosa
 import cairosvg
 import intel_extension_for_pytorch as ipex
+from contextlib import contextmanager
+import gc
 
 # Инициализация устройства
 device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
@@ -72,6 +74,15 @@ conn.commit()
 
 # Хранилище диалогов в памяти
 dialogs = {}
+
+@contextmanager
+def xpu_memory_scope(device="xpu:0"):
+    try:
+        yield
+    finally:
+        torch.xpu.synchronize(device)
+        torch.xpu.empty_cache()
+        gc.collect()
 
 # Функции сжатия/распаковки
 def compress(obj):
@@ -127,140 +138,141 @@ async def pipeline_worker():
 
     # Инициализация моделей с IPEX
     model_path = "microsoft/Phi-3-mini-4k-instruct"
-    
-    model = AutoModelForCausalLM.from_pretrained( 
-#        model_path,
-#        torch_dtype="auto",
-#        trust_remote_code=True,
-#        attn_implementation='eager',#attn_implementation="flash_attention_2",
-#        device_map="xpu"
-        model_path,
-        trust_remote_code=True,
-        use_cache=True,
-        attn_implementation='eager',
-        #device_map="xpu"
-    )
-    #model = model.to(device)
-    model = model.to("xpu:0")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    
-    #model = ipex.optimize(model, dtype=torch.bfloat16)
-    
-    #tokenizer = AutoTokenizer.from_pretrained(model_path)
-    
-    pipe = pipeline( 
-        "text-generation", 
-        model=model, 
-        tokenizer=tokenizer, 
-        device="xpu:0"
-    )
+    with xpu_memory_scope():
+        model = AutoModelForCausalLM.from_pretrained( 
+    #        model_path,
+    #        torch_dtype="auto",
+    #        trust_remote_code=True,
+    #        attn_implementation='eager',#attn_implementation="flash_attention_2",
+    #        device_map="xpu"
+            model_path,
+            trust_remote_code=True,
+            use_cache=True,
+            attn_implementation='eager',
+            #device_map="xpu"
+        )
+        #model = model.to(device)
+        model = model.to("xpu:0")
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        #model = ipex.optimize(model, dtype=torch.bfloat16)
+        
+        #tokenizer = AutoTokenizer.from_pretrained(model_path)
+        
+        pipe = pipeline( 
+            "text-generation", 
+            model=model, 
+            tokenizer=tokenizer, 
+            device="xpu:0"
+        )
 
-    generation_args = { 
-        "max_new_tokens": 250,
-        "return_full_text": False,
-        "temperature": 0.0,
-        "do_sample": False,
-    }
-    print ("---------------------->")
-    # Инициализация Whisper
-    whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        WHISPER_MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        #low_cpu_mem_usage=True,
-        use_safetensors=True
-    )
-    whisper_model.to("xpu:1")
-    whisper_model = ipex.optimize(whisper_model, dtype=torch.bfloat16)
-    
-    whisper_processor = AutoProcessor.from_pretrained(WHISPER_MODEL_ID)
-    
-    whisper_pipe = pipeline(
-        "automatic-speech-recognition",
-        model=whisper_model,
-        tokenizer=whisper_processor.tokenizer,
-        feature_extractor=whisper_processor.feature_extractor,
-        torch_dtype=torch.bfloat16,
-        device="xpu:1",
-    )
-    print ("----------------------> 2")
-    # Инициализация XTTS
-    xtts_config = XttsConfig()
-    xtts_config.load_json("/home/naturalkind/agi/XTTS-v2/config.json")
-    xtts_model = Xtts.init_from_config(xtts_config)
-    xtts_model.load_checkpoint(xtts_config, checkpoint_dir="/home/naturalkind/agi/XTTS-v2/", eval=True)
-    xtts_model.to("xpu:1")
-    
-    print ("----------------------> 3")
-    async def send_status_update(chat_id, message_id, status):
-        await sender.send(compress({
-            'chat_id': chat_id,
-            'message_id': message_id,
-            'status': status,
-            'type': 'status_update'
-        }))
+        generation_args = { 
+            "max_new_tokens": 250,
+            "return_full_text": False,
+            "temperature": 0.0,
+            "do_sample": False,
+        }
+        print ("---------------------->")
+        # Инициализация Whisper
+        whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            WHISPER_MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            #low_cpu_mem_usage=True,
+            use_safetensors=True
+        )
+        whisper_model.to("xpu:1")
+        whisper_model = ipex.optimize(whisper_model, dtype=torch.bfloat16)
+        
+        whisper_processor = AutoProcessor.from_pretrained(WHISPER_MODEL_ID)
+        
+        whisper_pipe = pipeline(
+            "automatic-speech-recognition",
+            model=whisper_model,
+            tokenizer=whisper_processor.tokenizer,
+            feature_extractor=whisper_processor.feature_extractor,
+            torch_dtype=torch.bfloat16,
+            device="xpu:1",
+        )
+        print ("----------------------> 2")
+        # Инициализация XTTS
+        xtts_config = XttsConfig()
+        xtts_config.load_json("/home/naturalkind/agi/XTTS-v2/config.json")
+        xtts_model = Xtts.init_from_config(xtts_config)
+        xtts_model.load_checkpoint(xtts_config, checkpoint_dir="/home/naturalkind/agi/XTTS-v2/", eval=True)
+        xtts_model.to("xpu:1")
+        
+        print ("----------------------> 3")
+        async def send_status_update(chat_id, message_id, status):
+            await sender.send(compress({
+                'chat_id': chat_id,
+                'message_id': message_id,
+                'status': status,
+                'type': 'status_update'
+            }))
 
-    while True:
-        try:
-            message = decompress(await receiver.recv())
-            chat_id = message['chat_id']
-            user_id = message['user_id']
-            message_id = message['message_id']
-            message_type = message['type']
+        while True:
+            try:
+                message = decompress(await receiver.recv())
+                chat_id = message['chat_id']
+                user_id = message['user_id']
+                message_id = message['message_id']
+                message_type = message['type']
 
-            if message_type == 'text':
-                text = message['text']
-                await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
-            elif message_type == 'voice':
-                audio_content = message['audio_content']
-                await send_status_update(chat_id, message_id, "🎙️ Обработка голоса...")
-                result = whisper_pipe(audio_content)
+                if message_type == 'text':
+                    text = message['text']
+                    await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
+                elif message_type == 'voice':
+                    audio_content = message['audio_content']
+                    await send_status_update(chat_id, message_id, "🎙️ Обработка голоса...")
+                    result = whisper_pipe(audio_content)
+                    torch.xpu.empty_cache()
+                    text = result["text"]
+                    await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
+                elif message_type == 'file':
+                    text = message['text']
+                    await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
+                else:
+                    continue
+
+                cursor.execute('SELECT message, role FROM dialogs WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 5', (chat_id,))
+                history = cursor.fetchall()
+                history.reverse()
+                messages = [{"role": role, "content": msg} for msg, role in history]
+                messages.append({"role": "user", "content": text})
+                print ("IN-----------------------------")
+                await send_status_update(chat_id, message_id, "🧠 Генерация ответа...")
+                output = pipe(messages, **generation_args)
+                response = output[0]['generated_text']
+                torch.xpu.synchronize()
                 torch.xpu.empty_cache()
-                text = result["text"]
-                await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
-            elif message_type == 'file':
-                text = message['text']
-                await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
-            else:
-                continue
-
-            cursor.execute('SELECT message, role FROM dialogs WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 5', (chat_id,))
-            history = cursor.fetchall()
-            history.reverse()
-            messages = [{"role": role, "content": msg} for msg, role in history]
-            messages.append({"role": "user", "content": text})
-            print ("IN-----------------------------")
-            await send_status_update(chat_id, message_id, "🧠 Генерация ответа...")
-            output = pipe(messages, **generation_args)
-            response = output[0]['generated_text']
-            torch.xpu.empty_cache()
-            if message_type == 'voice':
-                await send_status_update(chat_id, message_id, "🔊 Синтез речи...")
-                output_path = synthesize_speech(response, xtts_model, xtts_config, user_id)
-                response = f"Перевод: {text} Ответ: {response}"
-                with open(output_path, 'rb') as audio_file:
-                    audio_content = audio_file.read()
-                
-                await sender.send(compress({
-                    'chat_id': chat_id,
-                    'audio': audio_content,
-                    'text': response,
-                    'message_id': message_id,
-                    'type': 'voice'
-                }))
-            else:
-                await sender.send(compress({
-                    'chat_id': chat_id,
-                    'text': response,
-                    'message_id': message_id,
-                    'type': 'text'
-                }))
-            print ("OUT---------------------", response, message_type, torch.xpu.empty_cache())
-            #torch.xpu.empty_cache()
-            torch.xpu.reset_accumulated_memory_stats(device="xpu:0")
-            torch.xpu.reset_peak_memory_stats(device="xpu:0")
-        except Exception as e:
-            torch.xpu.empty_cache()
-            logger.error(f"Error in pipeline worker: {e}")
+                if message_type == 'voice':
+                    await send_status_update(chat_id, message_id, "🔊 Синтез речи...")
+                    output_path = synthesize_speech(response, xtts_model, xtts_config, user_id)
+                    response = f"Перевод: {text} Ответ: {response}"
+                    with open(output_path, 'rb') as audio_file:
+                        audio_content = audio_file.read()
+                    
+                    await sender.send(compress({
+                        'chat_id': chat_id,
+                        'audio': audio_content,
+                        'text': response,
+                        'message_id': message_id,
+                        'type': 'voice'
+                    }))
+                else:
+                    await sender.send(compress({
+                        'chat_id': chat_id,
+                        'text': response,
+                        'message_id': message_id,
+                        'type': 'text'
+                    }))
+                print ("OUT---------------------", response, message_type, torch.xpu.empty_cache())
+                #torch.xpu.empty_cache()
+                torch.xpu.reset_accumulated_memory_stats(device="xpu:0")
+                torch.xpu.reset_peak_memory_stats(device="xpu:0")
+            except Exception as e:
+                torch.xpu.empty_cache()
+                logger.error(f"Error in pipeline worker: {e}")
 
 ## Функция для запуска pipeline_worker
 def start_pipeline_worker():
