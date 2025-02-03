@@ -1,13 +1,18 @@
 # LLM
 
 подключение LLM модели к `telegram bot api`, реализована простая очередь обработки запросов в GPU
-Python 3.10.0
+> nvidia gpu python 3.10.0
 
 ```
-pip install -r requirements.txt
+pip install -r requirements-cuda.txt
 python start_bot_app_v1.py
 ```
+> intel xpu python 3.11.0
 
+```
+pip install -r requirements-intel.txt
+python start_bot_app_v1.py
+```
 ### Нужно сделать
 - [ ] генерация изображения   
 - [ ] анимация изображения   
