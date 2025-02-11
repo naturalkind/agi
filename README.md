@@ -19,7 +19,7 @@ python start_bot_app_v3_intel.py
 - Whisper для распознавания речи https://huggingface.co/openai/whisper-large-v3
 - XTTS для синтеза голоса https://github.com/coqui-ai/TTS & https://huggingface.co/coqui/XTTS-v2
 
-![Иллюстрация к проекту](https://github.com/naturalkind/agi/blob/main/media/example.png)
+![Иллюстрация к проекту](https://github.com/naturalkind/agi/blob/v0.1/media/example.png)
 
 ### Нужно сделать
 - [ ] генерация изображения   
