@@ -140,23 +140,16 @@ async def pipeline_worker():
     model_path = "microsoft/Phi-3-mini-4k-instruct"
     with xpu_memory_scope():
         model = AutoModelForCausalLM.from_pretrained( 
-    #        model_path,
-    #        torch_dtype="auto",
-    #        trust_remote_code=True,
-    #        attn_implementation='eager',#attn_implementation="flash_attention_2",
-    #        device_map="xpu"
             model_path,
             trust_remote_code=True,
             use_cache=True,
             attn_implementation='eager',
-            #device_map="xpu"
         )
         #model = model.to(device)
         model = model.to("xpu:0")
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
         #model = ipex.optimize(model, dtype=torch.bfloat16)
-        
         #tokenizer = AutoTokenizer.from_pretrained(model_path)
         
         pipe = pipeline( 
@@ -192,13 +185,15 @@ async def pipeline_worker():
             feature_extractor=whisper_processor.feature_extractor,
             torch_dtype=torch.bfloat16,
             device="xpu:1",
+            chunk_length_s=30,
+            batch_size=16, 
         )
         print ("----------------------> 2")
         # Инициализация XTTS
         xtts_config = XttsConfig()
-        xtts_config.load_json("/home/naturalkind/agi/XTTS-v2/config.json")
+        xtts_config.load_json("./XTTS-v2/config.json")
         xtts_model = Xtts.init_from_config(xtts_config)
-        xtts_model.load_checkpoint(xtts_config, checkpoint_dir="/home/naturalkind/agi/XTTS-v2/", eval=True)
+        xtts_model.load_checkpoint(xtts_config, checkpoint_dir="./XTTS-v2/", eval=True)
         xtts_model.to("xpu:1")
         
         print ("----------------------> 3")
@@ -224,6 +219,7 @@ async def pipeline_worker():
                 elif message_type == 'voice':
                     audio_content = message['audio_content']
                     await send_status_update(chat_id, message_id, "🎙️ Обработка голоса...")
+                    print (type(audio_content))
                     result = whisper_pipe(audio_content)
                     torch.xpu.empty_cache()
                     text = result["text"]
@@ -267,9 +263,9 @@ async def pipeline_worker():
                         'type': 'text'
                     }))
                 print ("OUT---------------------", response, message_type, torch.xpu.empty_cache())
-                #torch.xpu.empty_cache()
-                torch.xpu.reset_accumulated_memory_stats(device="xpu:0")
-                torch.xpu.reset_peak_memory_stats(device="xpu:0")
+#                torch.xpu.empty_cache()
+#                torch.xpu.reset_accumulated_memory_stats(device="xpu:0")
+#                torch.xpu.reset_peak_memory_stats(device="xpu:0")
             except Exception as e:
                 torch.xpu.empty_cache()
                 logger.error(f"Error in pipeline worker: {e}")

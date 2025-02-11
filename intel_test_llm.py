@@ -39,7 +39,7 @@ else:
 ############# code changes ###############
 device_type = "cpu"
 if xpu_available:
-    device_type = "xpu:1"  # Явно указываем ID устройства
+    device_type = "xpu:0"  # Явно указываем ID устройства
 elif cuda_available:
     device_type = "cuda"
 print(">>>>>>>>>>>>>>>>>>", device_type)

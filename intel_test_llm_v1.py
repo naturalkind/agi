@@ -5,15 +5,6 @@ from transformers import AutoTokenizer
 import intel_extension_for_pytorch as ipex
 from accelerate.utils import is_xpu_available, is_ipex_available
 
-# Установка переменных окружения для корректной работы с XPU
-os.environ["SYCL_DEVICE_FILTER"] = "level_zero"
-os.environ["ZE_AFFINITY_MASK"] = "0"  # Для GPU с ID 0
-os.environ["ENABLE_SDP_FUSION"] = "1"
-os.environ["IPEX_XPU_ONEDNN_LAYOUT"] = "1"
-os.environ["NEOReadDebugKeys"] = "1"
-os.environ["EnableImplicitScaling"] = "1"
-os.environ["EnableForceProfilingPreemption"] = "1"
-
 cuda_available = torch.cuda.is_available()
 xpu_available = is_xpu_available() and is_ipex_available()
 
@@ -27,7 +18,7 @@ if xpu_available:
 PHI3_PROMPT_FORMAT = "<|user|>\n{prompt}<|end|>\n<|assistant|>"
 model_id = "microsoft/Phi-3-mini-4k-instruct"
 _prompt = "Написать сложный парсер текста Python"
-_max_tokens = 512*2
+_max_tokens = 512
 
 if xpu_available:
     model = AutoModelForCausalLM.from_pretrained(
@@ -59,45 +50,30 @@ if xpu_available:
     
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
+times = []
+test_count = 10
+
 with torch.inference_mode():
     prompt = PHI3_PROMPT_FORMAT.format(prompt=_prompt)
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device_type)
     
     # Разогрев с синхронизацией
     output = model.generate(input_ids, max_new_tokens=_max_tokens)
-    torch.xpu.synchronize()
-    
-    # Запуск инференса
-    st = time.time()
-    output = model.generate(input_ids, do_sample=False, max_new_tokens=_max_tokens)
-    
-    if xpu_available:
-        torch.xpu.synchronize()
-    elif cuda_available:
-        torch.cuda.synchronize()
-    else:
-        torch.cpu.synchronize()
+    for i in range(test_count):
+        # Запуск инференса
+        st = time.time()
+        output = model.generate(input_ids, do_sample=False, max_new_tokens=_max_tokens)
         
-    end = time.time()
-    output_str = tokenizer.decode(output[0], skip_special_tokens=False)
-    output_str = (
-        output_str.replace("<|user|>", "")
-        .replace("<|assistant|>", "")
-        .replace("<|end|>", "")[len(_prompt) + 4 :]
-    )
-    
-    print(f"Inference time: {end-st} s")
-    max_memory = (
-        torch.cuda.max_memory_allocated()
-        if cuda_available
-        else torch.xpu.max_memory_allocated()
-    )
-    print(f"Max memory allocated: {max_memory / (1024 ** 3):02} GB")
-    print("-" * 20, "Prompt", "-" * 20)
-    print(
-        prompt.replace("<|user|>", "")
-        .replace("<|assistant|>", "")
-        .replace("<|end|>", "")
-    )
-    print("-" * 20, "Output", "-" * 20)
-    print(output_str)
+        if xpu_available:
+            torch.xpu.synchronize()
+        elif cuda_available:
+            torch.cuda.synchronize()
+        else:
+            torch.cpu.synchronize()
+            
+        end = time.time()
+        times.append(end-st)
+        print(f"Inference time: {end-st} s")
+        torch.xpu.empty_cache()
+print (f"Среднее значение {test_count}: {sum(times)/test_count}")
+

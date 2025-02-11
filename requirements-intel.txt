@@ -182,7 +182,7 @@ tornado==6.4.2
 tqdm==4.67.1
 trainer==0.0.36
 transformers==4.46.3
--e git+https://github.com/naturalkind/agi.git@4a96a052b7e69430aa2ad61c8238655358404a6f#egg=TTS&subdirectory=TTS
+TTS
 typeguard==4.4.1
 typer==0.14.0
 typing_extensions==4.12.2
