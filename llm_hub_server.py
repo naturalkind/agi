@@ -30,16 +30,17 @@ import librosa
 import cairosvg
 import intel_extension_for_pytorch as ipex
 from contextlib import contextmanager
+from urllib.parse import urljoin
 import gc
-
-# Инициализация устройства
-device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
-print(f"Using device: {device}")
-print(torch.xpu.get_device_name(0), torch.xpu.is_available())    
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# Инициализация устройства
+device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
+logger.info(f"Using device: {device} | {torch.xpu.get_device_name(0)} | {torch.xpu.is_available()}")
 
 # Конфигурация моделей
 WHISPER_MODEL_ID = "whisper-large-v3"
@@ -128,7 +129,7 @@ def synthesize_speech(text, model, config, user_id):
             language="ru",
         )
         wav_chunks.append(outputs["wav"])
-    wav_path = f"data_users/clon_out.wav"
+    wav_path = f"data_users/{user_id}_clon_out.wav"
     sf.write(wav_path, np.concatenate(wav_chunks), samplerate=config.audio.output_sample_rate)
     return wav_path
 
@@ -156,6 +157,105 @@ async def query_phi3_server(messages, generation_args={"max_new_tokens":250, "te
         logger.error(f"Failed to query Phi-3 server: {str(e)}")
         return None
 
+# Новый обработчик для callback
+class VideoCallbackHandler(tornado.web.RequestHandler):
+    async def post(self):
+        try:
+            data = json.loads(self.request.body)
+            task_id = data['task_id']
+            status = data['status']
+            # Получаем связанные данные из Redis
+            task_data = redis_client.get(f"video_task:{task_id}")
+            if not task_data:
+                return
+                
+            task_data = json.loads(task_data)
+            chat_id = task_data['chat_id']
+            message_id = task_data['message_id']
+            
+            
+#            chat_id = "603789567"
+#            message_id = "873"
+            
+            #print ("WORK VIDEOCALLBACKHANDLER", data, chat_id, message_id)
+            if status == 'completed':
+                video_url = urljoin('https://192.168.1.50:5000/', data['download_url'])
+                await self.send_video_to_telegram(chat_id, message_id, video_url)
+                
+                # Удаляем временные данные
+                redis_client.delete(f"video_task:{task_id}")
+
+        except Exception as e:
+            logger.error(f"Video callback error: {str(e)}")
+
+    async def download_video(self, video_url: str) -> None:
+        headers = {"X-API-Key": "default-api-key-change-me"}
+        ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
+        ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
+        ssl_context.check_hostname = True
+        ssl_context.verify_mode = ssl.CERT_REQUIRED       
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=ssl_context)
+        ) as session:
+            async with session.get(video_url, headers=headers) as response:
+                response.raise_for_status()
+                return await response.read()
+                    
+    async def send_video_to_telegram(self, chat_id, message_id, video_url):
+        async with aiohttp.ClientSession() as session:
+            # Скачиваем видео
+            video_data = await self.download_video(video_url)
+
+            # Отправляем видео в Telegram
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+            data = aiohttp.FormData()
+            data.add_field('chat_id', str(chat_id))
+            data.add_field('reply_to_message_id', str(message_id))
+            data.add_field('video', video_data, 
+                         filename='video.mp4',
+                         content_type='video/mp4')
+            
+            async with session.post(url, data=data) as tg_resp:
+                if tg_resp.status != 200:
+                    logger.error(f"Failed to send video: {await tg_resp.text()}")
+
+async def query_synthesize_video_server(user_id, chat_id, message_id):
+    try:
+#        audio_path = f"data_users/speaker_reference_{user_id}.wav"
+        audio_path = f"data_users/{user_id}_clon_out.wav"
+        image_path = f"data_users/speaker_reference_{user_id}.jpg"  # Предполагаем наличие изображения
+        callback_url = "https://192.168.1.50:8443/video_callback"  # Ваш внешний URL
+        
+        ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
+        ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
+        if not os.path.exists(image_path):
+            image_path = "/home/npu/agi/media/4.jpg"  # Запасное изображение
+        data = aiohttp.FormData()
+        data.add_field('audio', open(audio_path, 'rb'), filename='audio.wav')
+        data.add_field('image', open(image_path, 'rb'), filename='image.jpg')
+        data.add_field('video_params', json.dumps({"pose_weight": 1.0}))
+        data.add_field('callback_url', callback_url)
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
+            async with session.post('https://192.168.1.50:5000/generate_video', data=data) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    task_id = result.get('task_id')
+                    # Сохраняем связь задачи с чатом
+                    redis_client.setex(
+                        f"video_task:{task_id}",
+                        3600,  # 1 час
+                        json.dumps({
+                            'chat_id': chat_id,
+                            'message_id': message_id,
+                            'user_id': user_id
+                        })
+                    )
+                    return task_id
+    except Exception as e:
+        logger.error(f"Video task creation failed: {str(e)}")
+    return None
+    
+
 async def pipeline_worker():
     from TTS.tts.configs.xtts_config import XttsConfig
     from TTS.tts.models.xtts import Xtts
@@ -170,7 +270,33 @@ async def pipeline_worker():
 
     # Инициализация моделей с IPEX
     with xpu_memory_scope():
+        # Инициализация Language model
+#        model = AutoModelForCausalLM.from_pretrained( 
+#            model_path,
+#            trust_remote_code=True,
+#            use_cache=True,
+#            attn_implementation='eager',
+#        )
+#        #model = model.to(device)
+#        model = model.to("xpu:0")
+#        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+#        
+#        #model = ipex.optimize(model, dtype=torch.bfloat16)
+#        #tokenizer = AutoTokenizer.from_pretrained(model_path)
+#        
+#        pipe = pipeline( 
+#            "text-generation", 
+#            model=model, 
+#            tokenizer=tokenizer, 
+#            device="xpu:0"
+#        )
 
+#        generation_args = { 
+#            "max_new_tokens": 250,
+#            "return_full_text": False,
+#            "temperature": 0.0,
+#            "do_sample": False,
+#        }
         # Инициализация Whisper
         whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
             WHISPER_MODEL_ID,
@@ -193,6 +319,9 @@ async def pipeline_worker():
             chunk_length_s=30,
             batch_size=16, 
         )
+        
+        # XTTS перенашу на сервер intel
+        """"""
         # Инициализация XTTS
         xtts_config = XttsConfig()
         xtts_config.load_json("./XTTS-v2/config.json")
@@ -202,6 +331,8 @@ async def pipeline_worker():
         # В конфигурации XTTS установите
         xtts_config.batch_size = 8  # Увеличить размер батча
         xtts_config.use_low_precision = True  # Использовать низкую точность
+        
+        
         
         
         async def send_status_update(chat_id, message_id, status):
@@ -226,7 +357,6 @@ async def pipeline_worker():
                 elif message_type == 'voice':
                     audio_content = message['audio_content']
                     await send_status_update(chat_id, message_id, "🎙️ Обработка голоса...")
-                    print (type(audio_content))
                     result = whisper_pipe(audio_content)
                     torch.xpu.empty_cache()
                     text = result["text"]
@@ -243,18 +373,36 @@ async def pipeline_worker():
                 messages = [{"role": role, "content": msg} for msg, role in history]
                 messages.append({"role": "user", "content": text})
                 await send_status_update(chat_id, message_id, "🧠 Генерация ответа...")
-                output = await query_phi3_server(messages)
-                
+                #-------------------------------_>
+                output = await query_phi3_server(messages) 
                 if output is None:
                     response = "⚠️ Ошибка при обработке запроса. Попробуйте позже."
                 else:
                     response = output.get("response", "Не удалось получить ответ")
-                #response = output['response']#output[0]['generated_text']
+                # ------------------------------
+#                output = pipe(messages, **generation_args)
+#                response = output[0]['generated_text']
+                
+                #message_type = 'voice' # временно для запуска голоса
+                #-------------------------------
+                
+
                 torch.xpu.synchronize()
                 torch.xpu.empty_cache()
                 if message_type == 'voice':
                     await send_status_update(chat_id, message_id, "🔊 Синтез речи...")
                     output_path = synthesize_speech(response, xtts_model, xtts_config, user_id)
+                    #------------------------
+                    #подключаюсь к серверу
+                    await send_status_update(chat_id, message_id, "🎥 Генерация видео...")
+                    video_task_id = await query_synthesize_video_server(user_id, chat_id, message_id)
+                                                                        
+                    
+                    # Сохраняем временный ответ
+                    response += "\n\n🎬 Видео обрабатывается..."                    
+                    
+                    
+                    #------------------------
                     response = f"Перевод: {text} Ответ: {response}"
                     with open(output_path, 'rb') as audio_file:
                         audio_content = audio_file.read()
@@ -266,6 +414,8 @@ async def pipeline_worker():
                         'message_id': message_id,
                         'type': 'voice'
                     }))
+
+                    
                 else:
                     await sender.send(compress({
                         'chat_id': chat_id,
@@ -273,7 +423,6 @@ async def pipeline_worker():
                         'message_id': message_id,
                         'type': 'text'
                     }))
-                print ("ВЫПОЛНЕНО --------------------->", response, message_type)
                 torch.xpu.empty_cache()
 #                torch.xpu.reset_accumulated_memory_stats(device="xpu:0")
 #                torch.xpu.reset_peak_memory_stats(device="xpu:0")
@@ -326,7 +475,6 @@ class MessageHandler(tornado.web.RequestHandler):
     async def post(self):
         try:
             data = json.loads(self.request.body)
-            print ("--INNN", data)
             if 'message' in data:
                 message = data['message']
                 chat_id = message['chat']['id']
@@ -446,14 +594,14 @@ class MessageHandler(tornado.web.RequestHandler):
                 async with session.post(url, data=data) as response:
                     if response.status != 200:
                         error_text = await response.text()
-                        print(f"Error sending image: {error_text}")
+                        logger.error(f"Error sending image: {error_text}")
                     return await response.json()
                     
         except FileNotFoundError:
-            print(f"Error: Image file not found at {image_path}")
+            logger.error(f"Error: Image file not found at {image_path}")
             return None
         except Exception as e:
-            print(f"Error occurred: {str(e)}")
+            logger.error(f"Error occurred: {str(e)}")
             return None
 
     async def update_menu_message(self, chat_id, message_id, new_text, show_back_button=True):
@@ -718,49 +866,8 @@ class MessageHandler(tornado.web.RequestHandler):
         async with aiohttp.ClientSession() as session:
             await session.post(url, json=data)
 
-
-#async def send_message(chat_id, message_id, text, typing_tasks):
-#    code_block, code_start = get_code_block(text)
-#    if len(text) <= 4096:
-#        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-#        data = {
-#            "chat_id": chat_id,
-#            "text": text,
-#            "reply_to_message_id": message_id,
-#            "parse_mode": "Markdown"
-#        }
-#        async with aiohttp.ClientSession() as session:
-#            async with session.post(url, json=data) as response:
-#                if response.status != 200:
-#                    logger.error(f"Failed to send message. Status code: {response.status}, Response: {await response.text()}")
-#    else:
-#        pre_text = text[:code_start] if 0 < code_start < 4096 else text[:50]
-#        await send_message(chat_id, message_id, f"Ответ слишком большой: {pre_text}...", typing_tasks)
-#        
-#        file = StringIO(text)
-#        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-#        data = aiohttp.FormData()
-#        data.add_field('chat_id', str(chat_id))
-#        data.add_field('document', file, filename='response.txt')
-#        async with aiohttp.ClientSession() as session:
-#            async with session.post(url, data=data) as response:
-#                if response.status != 200:
-#                    logger.error(f"Failed to send document. Status code: {response.status}, Response: {await response.text()}")
-#    unique_key = f"{chat_id}:{message_id}"
-#    # завершение отображение печати
-#    if unique_key in typing_tasks:
-#        typing_task = typing_tasks[unique_key]
-#        del typing_tasks[unique_key]
-#        if not typing_task.done():
-#            typing_task.cancel()
-#            try:
-#                await typing_task
-#            except asyncio.CancelledError:
-#                pass
-
 async def send_message(chat_id, message_id, text, typing_tasks):
 
-    print ("ОБРАТНЫЙ ОТВЕТ SEND_MESSAGE -------------------->", chat_id, message_id, text, typing_tasks)
     code_block, code_start = get_code_block(text)
     
     ## Создаем разметку с кнопкой сброса
@@ -867,7 +974,6 @@ async def send_status_message(chat_id, reply_to_message_id, text):
 
 async def process_responses(receiver, send_message_func):
     status_messages = {}  # Словарь для хранения ID сообщений статуса
-    print ("--------->СТАРТ PROCESS_RESPONSES<--------------------")
     async def update_status_message(chat_id, message_id, status):
         if (chat_id, message_id) in status_messages:
             status_message_id = status_messages[(chat_id, message_id)]
@@ -888,7 +994,6 @@ async def process_responses(receiver, send_message_func):
             response = decompress(response)
             chat_id = response['chat_id']
             message_id = response['message_id']
-            
             if response['type'] == 'status_update':
                 await update_status_message(chat_id, message_id, response['status'])
             else:
@@ -930,6 +1035,7 @@ if __name__ == '__main__':
             send_message_func=lambda chat_id, message_id, text: send_message(chat_id, message_id, text, typing_tasks),
             typing_tasks=typing_tasks
         )),
+        (r'/video_callback', VideoCallbackHandler),
     ])
     
     http_server = tornado.httpserver.HTTPServer(

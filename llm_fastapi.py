@@ -56,7 +56,7 @@ async def lifespan(app: FastAPI):
     global model, tokenizer
     ## Загрузка модели и токенизатора
     model_id = "/home/npu/sd/Phi-3.5-mini-instruct-openvino-4bit"
-    model = OVModelForCausalLM.from_pretrained(model_id, device="GPU.1")
+    model = OVModelForCausalLM.from_pretrained(model_id, device="GPU.0")
 
     # Загрузка токенизатора
     tokenizer = AutoTokenizer.from_pretrained(model_id)

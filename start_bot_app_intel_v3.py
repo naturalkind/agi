@@ -212,7 +212,7 @@ async def pipeline_worker():
                 user_id = message['user_id']
                 message_id = message['message_id']
                 message_type = message['type']
-
+                print ("!!!!!!!!!!!!!!!!!----------> 3")
                 if message_type == 'text':
                     text = message['text']
                     await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
