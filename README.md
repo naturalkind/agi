@@ -1,6 +1,8 @@
 # LLM
 
-подключение LLM модели к `telegram bot api`, реализована простая очередь обработки запросов в GPU
+Подключение искуственных нейросетевых моделей к `telegram bot api`, для 
+создания персонального помошника с множеством функций. [90% кода сгенерировано языковыми моделями](https://habr.com/ru/articles/881944/) 
+
 > nvidia gpu python 3.10.0
 
 ```
@@ -15,9 +17,10 @@ start_bot_app_intel_v3.py
 ```
 
 ### Технологии:
-- LLM модель поддерживаемая transformers
-- Whisper для распознавания речи https://huggingface.co/openai/whisper-large-v3
-- XTTS для синтеза голоса https://github.com/coqui-ai/TTS & https://huggingface.co/coqui/XTTS-v2
+- LLM модель поддерживаемая transformers 
+- Whisper распознавание речи https://huggingface.co/openai/whisper-large-v3
+- XTTS синтез голоса https://github.com/coqui-ai/TTS & https://huggingface.co/coqui/XTTS-v2
+- Hallo анимация портретных изображений https://github.com/fudan-generative-vision/hallo
 
 ![Иллюстрация к проекту](https://github.com/naturalkind/agi/blob/v0.1/media/example.png)
 
@@ -28,7 +31,7 @@ start_bot_app_intel_v3.py
 - [x] параллельная работа GPU, распределённые вычисления   
 - [x] очередь задач баланс между участниками   
 - [x] анимации лица на изображении с помощью голоса   
-- [ ] reasoning | rag   
+- [ ] reasoning | rag | rl   
 - [x] перевод голоса в текст с дальнейшей генерацией текста   
 - [x] языковая модель чат бот   
 - [x] отображение выполнения задач пользователю   

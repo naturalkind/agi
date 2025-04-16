@@ -1,12 +1,13 @@
 import intel_extension_for_pytorch as ipex
-import time, os
 import torch
+
+import time, os
 import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from optimum.intel import OVModelForCausalLM
-from transformers import AutoTokenizer, pipeline, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, pipeline, AutoModelForCausalLM, AutoModelForSeq2SeqLM
 from openvino.runtime import Core
 from typing import List, Dict
 
@@ -56,7 +57,7 @@ async def lifespan(app: FastAPI):
     global model, tokenizer
     ## Загрузка модели и токенизатора
     model_id = "/home/npu/sd/Phi-3.5-mini-instruct-openvino-4bit"
-    model = OVModelForCausalLM.from_pretrained(model_id, device="GPU.0")
+    model = OVModelForCausalLM.from_pretrained(model_id, device="GPU.1")
 
     # Загрузка токенизатора
     tokenizer = AutoTokenizer.from_pretrained(model_id)

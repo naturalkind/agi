@@ -11,8 +11,9 @@ import torch
 import OpenSSL
 from pathlib import Path
 from datetime import datetime
+import time
 from werkzeug.utils import secure_filename
-from typing import Dict, Any, Optional
+from typing import Dict, List, Any, Optional
 
 # Импорт модулей ML из оригинального кода
 from torch import nn
@@ -97,9 +98,28 @@ class Net(nn.Module):
             "audioproj": self.audioproj,
         }
 
+#class TaskManager:
+#    def __init__(self):
+#        self.tasks: Dict[str, Dict] = {}
+#    
+#    def create_task(self, task_data: Dict) -> str:
+#        task_id = str(uuid.uuid4())
+#        task_data.update({
+#            "task_id": task_id,
+#            "status": "queued",
+#            "progress": 0.0,
+#            "created_at": datetime.now().isoformat(),
+#            "completed_at": None,
+#            "error": None
+#        })
+#        self.tasks[task_id] = task_data
+#        return task_id
+
 class TaskManager:
     def __init__(self):
         self.tasks: Dict[str, Dict] = {}
+        self.task_queue = asyncio.Queue()
+        self.is_processing = False
     
     def create_task(self, task_data: Dict) -> str:
         task_id = str(uuid.uuid4())
@@ -112,7 +132,59 @@ class TaskManager:
             "error": None
         })
         self.tasks[task_id] = task_data
+        
+        # Add task to the queue
+        asyncio.create_task(self.task_queue.put(task_id))
+        
+        # Start queue processing if not already running
+        if not self.is_processing:
+            asyncio.create_task(self._process_queue())
+            
         return task_id
+    
+    async def _process_queue(self):
+        """Process tasks in the queue one after another"""
+        self.is_processing = True
+        
+        while True:
+            try:
+                # Get the next task from the queue
+                task_id = await self.task_queue.get()
+                
+                if task_id not in self.tasks:
+                    self.task_queue.task_done()
+                    continue
+                
+                # Get the application context
+                app = self.tasks[task_id].get('app')
+                if not app:
+                    self.tasks[task_id]['status'] = 'failed'
+                    self.tasks[task_id]['error'] = 'Application context not found'
+                    self.task_queue.task_done()
+                    continue
+                
+                # Process the task
+                try:
+                    self.tasks[task_id]['status'] = 'processing'
+                    await process_video_task(app, task_id)
+                    self.tasks[task_id]['status'] = 'completed'
+                    self.tasks[task_id]['completed_at'] = datetime.now().isoformat()
+                except Exception as e:
+                    self.tasks[task_id]['status'] = 'failed'
+                    self.tasks[task_id]['error'] = str(e)
+                    self.tasks[task_id]['completed_at'] = datetime.now().isoformat()
+                
+                # Mark task as done in the queue
+                self.task_queue.task_done()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"Unexpected error in queue processing: {e}")
+                await asyncio.sleep(1)  # Avoid tight loop on persistent errors
+        
+        self.is_processing = False
+
 
 async def verify_client_cert(request: web.Request) -> bool:
     ssl_info = request.transport.get_extra_info('ssl_object')
@@ -275,17 +347,172 @@ async def handle_generate_video(request: web.Request) -> web.Response:
     task_id = task_mgr.create_task({
         **file_paths,
         "params": json.loads(data.get('video_params', '{}')),
-        "callback_url": data.get('callback_url')
+        "callback_url": data.get('callback_url'),
+        "app": request.app  # Передаем ссылку на приложение
     })
     
     # Запуск фоновой задачи
-    asyncio.create_task(process_video_task(request.app, task_id))
+    #asyncio.create_task(process_video_task(request.app, task_id))
     
     return web.json_response({
         "task_id": task_id,
         "status": "queued",
         "created_at": task_mgr.tasks[task_id]['created_at']
     })
+
+## Работает
+#async def process_video_task(app: web.Application, task_id: str):
+#    """Фоновая задача обработки видео с полной логикой генерации"""
+#    task = app['task_manager'].tasks[task_id]
+#    save_path = OUTPUT_DIR / f"temp_{task_id}"
+#    output_path = OUTPUT_DIR / f"{task_id}.mp4"
+#    # Create a temporary save path for intermediate files
+#    os.makedirs(save_path, exist_ok=True)
+#    
+#    
+#    models = app['models']
+#    config = models['config']
+#    pipeline = models['pipeline']
+#    device = models['device']
+#    net = models['net']
+#        
+#    
+#    try:
+#        # 1. Prepare source image, face mask, face embeddings
+#        img_size = (config.data.source_image.width, config.data.source_image.height)
+#        clip_length = config.data.n_sample_frames
+#        face_analysis_model_path = config.face_analysis.model_path
+#        
+#        with ImageProcessor(img_size, face_analysis_model_path) as image_processor:
+#            source_image_pixels, \
+#            source_image_face_region, \
+#            source_image_face_emb, \
+#            source_image_full_mask, \
+#            source_image_face_mask, \
+#            source_image_lip_mask = image_processor.preprocess(str(task['image']), str(save_path), config.face_expand_ratio)
+
+#        # 2. Prepare audio embeddings
+#        sample_rate = config.data.driving_audio.sample_rate
+#        assert sample_rate == 16000, "audio sample rate must be 16000"
+#        fps = config.data.export_video.fps
+#        wav2vec_model_path = config.wav2vec.model_path
+#        wav2vec_only_last_features = config.wav2vec.features == "last"
+#        audio_separator_model_file = config.audio_separator.model_path
+#        
+#        with AudioProcessor(
+#            sample_rate,
+#            fps,
+#            wav2vec_model_path,
+#            wav2vec_only_last_features,
+#            os.path.dirname(audio_separator_model_file),
+#            os.path.basename(audio_separator_model_file),
+#            os.path.join(save_path, "audio_preprocess")
+#        ) as audio_processor:
+#            audio_emb, audio_length = audio_processor.preprocess(str(task['audio']), clip_length)
+
+#        # 3. Process audio embeddings
+#        audio_emb = process_audio_emb(audio_emb)
+#        # 4. Prepare tensors for inference
+#        source_image_pixels = source_image_pixels.unsqueeze(0)
+#        source_image_face_region = source_image_face_region.unsqueeze(0)
+#        source_image_face_emb = source_image_face_emb.reshape(1, -1)
+#        source_image_face_emb = torch.tensor(source_image_face_emb)
+
+#        source_image_full_mask = [
+#            (mask.repeat(clip_length, 1))
+#            for mask in source_image_full_mask
+#        ]
+#        source_image_face_mask = [
+#            (mask.repeat(clip_length, 1))
+#            for mask in source_image_face_mask
+#        ]
+#        source_image_lip_mask = [
+#            (mask.repeat(clip_length, 1))
+#            for mask in source_image_lip_mask
+#        ]
+
+#        times = audio_emb.shape[0] // clip_length
+#        tensor_result = []
+#        generator = torch.manual_seed(42)
+#        motion_scale = [
+#            task['params'].get('pose_weight', 1.0),
+#            task['params'].get('face_weight', 1.0),
+#            task['params'].get('lip_weight', 1.0)
+#        ]
+#        for t in range(times):
+#            print(f"[{t+1}/{times}]")
+
+#            if len(tensor_result) == 0:
+#                # The first iteration
+#                motion_zeros = source_image_pixels.repeat(
+#                    config.data.n_motion_frames, 1, 1, 1)
+#                motion_zeros = motion_zeros.to(
+#                    dtype=source_image_pixels.dtype, device=source_image_pixels.device)
+#                pixel_values_ref_img = torch.cat(
+#                    [source_image_pixels, motion_zeros], dim=0)  # concat the ref image and the first motion frames
+#            else:
+#                motion_frames = tensor_result[-1][0]
+#                motion_frames = motion_frames.permute(1, 0, 2, 3)
+#                motion_frames = motion_frames[0-config.data.n_motion_frames:]
+#                motion_frames = motion_frames * 2.0 - 1.0
+#                motion_frames = motion_frames.to(
+#                    dtype=source_image_pixels.dtype, device=source_image_pixels.device)
+#                pixel_values_ref_img = torch.cat(
+#                    [source_image_pixels, motion_frames], dim=0)  # concat the ref image and the motion frames
+
+#            pixel_values_ref_img = pixel_values_ref_img.unsqueeze(0)
+
+#            audio_tensor = audio_emb[
+#                t * clip_length: min((t + 1) * clip_length, audio_emb.shape[0])
+#            ]
+#            audio_tensor = audio_tensor.unsqueeze(0)
+#            audio_tensor = audio_tensor.to(
+#                device=net.audioproj.device, dtype=net.audioproj.dtype)
+#            audio_tensor = net.audioproj(audio_tensor)
+
+#            print (".......................>>>>>>", img_size, audio_emb.shape, 
+#                   pixel_values_ref_img.shape, config.data.n_sample_frames, len(motion_scale), motion_scale, source_image_face_region.shape) 
+#            # (512, 512) torch.Size([192, 5, 12, 768]) torch.Size([1, 3, 3, 512, 512]) 16 <class 'list'> <class 'torch.Tensor'>
+#            # (512, 512) torch.Size([192, 5, 12, 768]) torch.Size([1, 3, 3, 512, 512]) 16 3 [1.0, 1.0, 1.0] torch.Size([1, 3, 512, 512])
+
+#            # (512, 512) torch.Size([192, 5, 12, 768]) torch.Size([1, 3, 3, 512, 512]) 16 3 [1.0, 1.0, 1.0] torch.Size([1, 3, 512, 512])
+
+###             Запуск пайплайна
+
+#            pipeline_output = pipeline(
+#                ref_image=pixel_values_ref_img,
+#                audio_tensor=audio_tensor,
+#                face_emb=source_image_face_emb,
+#                face_mask=source_image_face_region,
+#                pixel_values_full_mask=source_image_full_mask,
+#                pixel_values_face_mask=source_image_face_mask,
+#                pixel_values_lip_mask=source_image_lip_mask,
+#                width=img_size[0],
+#                height=img_size[1],
+#                video_length=clip_length,
+#                num_inference_steps=config.inference_steps,
+#                guidance_scale=config.cfg_scale,
+#                generator=generator,
+#                motion_scale=motion_scale,
+#            )
+
+#            tensor_result.append(pipeline_output.videos)
+
+#        tensor_result = torch.cat(tensor_result, dim=2)
+#        tensor_result = tensor_result.squeeze(0)
+#        tensor_result = tensor_result[:, :audio_length]
+
+#        # 5. Save the result
+#        tensor_to_video(tensor_result, output_path, str(task['audio']))
+#        
+#        return True
+#    except Exception as e:
+#        print(f"Error in video generation: {str(e)}")
+#        return False
+#    finally:
+#        # Clean up temporary files
+#        shutil.rmtree(save_path, ignore_errors=True)
+
 
 async def process_video_task(app: web.Application, task_id: str):
     """Фоновая задача обработки видео с полной логикой генерации"""
@@ -306,19 +533,32 @@ async def process_video_task(app: web.Application, task_id: str):
     task['status'] = "processing"
     task['progress'] = 0.1        
     
+    user_id = str(task['image']).split("_")[2]
     try:
         # 1. Prepare source image, face mask, face embeddings
         img_size = (config.data.source_image.width, config.data.source_image.height)
         clip_length = config.data.n_sample_frames
         face_analysis_model_path = config.face_analysis.model_path
         
-        with ImageProcessor(img_size, face_analysis_model_path) as image_processor:
-            source_image_pixels, \
-            source_image_face_region, \
-            source_image_face_emb, \
-            source_image_full_mask, \
-            source_image_face_mask, \
-            source_image_lip_mask = image_processor.preprocess(str(task['image']), str(save_path), config.face_expand_ratio)
+        try:
+            with ImageProcessor(img_size, face_analysis_model_path) as image_processor:
+                source_image_pixels, \
+                source_image_face_region, \
+                source_image_face_emb, \
+                source_image_full_mask, \
+                source_image_face_mask, \
+                source_image_lip_mask, \
+                img_size_orig = image_processor.preprocess(str(task['image']), str(save_path), config.face_expand_ratio)
+        except IndexError:
+            print ("НЕТ ИЗОБРАЖЕНИЯ")
+            task.update({
+                "status": "error",
+                "progress": 0.0,
+                "completed_at": datetime.now().isoformat(),
+            })
+            await send_callback(task)
+            return
+                
 
         # 2. Prepare audio embeddings
         sample_rate = config.data.driving_audio.sample_rate
@@ -376,7 +616,17 @@ async def process_video_task(app: web.Application, task_id: str):
             task['params'].get('lip_weight', 1.0)
         ]
         
-        times = 4
+        #await send_callback(task)
+        print ("SEND_CALLBACK---", task, user_id)
+        if user_id == "naturalkind":
+            config.inference_steps = 10
+        else:
+            times_max = 14 #10 #4
+            times = min([times_max, times])
+            config.inference_steps = 5
+            
+            
+        _test_time_start = time.time()
         for t in range(times):
             if len(tensor_result) == 0:
                 # The first iteration
@@ -421,7 +671,7 @@ async def process_video_task(app: web.Application, task_id: str):
                 width=img_size[0],
                 height=img_size[1],
                 video_length=clip_length,
-                num_inference_steps=config.inference_steps+10,
+                num_inference_steps=config.inference_steps,
                 guidance_scale=config.cfg_scale,
                 generator=generator,
                 motion_scale=motion_scale,
@@ -430,15 +680,17 @@ async def process_video_task(app: web.Application, task_id: str):
             print (f"[{t+1}/{times}] OUT --------->", task['progress'], 
                    clip_length, config.inference_steps)
             tensor_result.append(pipeline_output.videos)
-
+            torch.cuda.empty_cache()
+            
+        _test_time_end = time.time() - _test_time_start
         tensor_result = torch.cat(tensor_result, dim=2)
         tensor_result = tensor_result.squeeze(0)
         tensor_result = tensor_result[:, :audio_length]
 
         # 5. Save the result
-        print ("SAVE THE RESULT", output_path, str(task['audio']))
-        tensor_to_video(tensor_result, str(output_path), str(task['audio']))
-        
+        print ("SAVE THE RESULT----------->", output_path, str(task['audio']), _test_time_end) # 415.62347054481506
+        tensor_to_video(tensor_result, str(output_path), str(task['audio']), img_size_orig)
+        torch.cuda.empty_cache() 
         # Обновление статуса
         task.update({
             "status": "completed",
@@ -481,20 +733,26 @@ async def send_callback(task: Dict):
     ssl_context = ssl.create_default_context(cafile='ssl/client_trust.pem') 
     ssl_context.check_hostname = False # не проверяем имея сервера, иначе ошибка
     ssl_context.verify_mode = ssl.CERT_REQUIRED
-    print ("--------->", task.get('output_path'))
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-        await session.post(
-            #task['callback_url'],
-            "https://178.158.131.41:8443/video_callback",
-            json={
-                "task_id": task['task_id'],
-                "status": task['status'],
-                "download_url": f"/download/{task['task_id']}",  # Добавляем URL для скачивания 
-                #"download_url": task.get('output_path'),
-                #"error": task.get('error')
-            }
-        )    
-
+        if task["status"] == "completed":
+            await session.post(
+                #task['callback_url'],
+                "https://178.158.131.41:8443/video_callback",
+                json={
+                    "task_id": task['task_id'],
+                    "status": task['status'],
+                    "download_url": f"/download/{task['task_id']}",  # Добавляем URL для скачивания 
+                    #"download_url": task.get('output_path'),
+                    #"error": task.get('error')
+                }
+            )    
+        else:
+            await session.get("https://178.158.131.41:8443/video_callback",
+                                json={
+                                    "task_id": task['task_id'],
+                                    "status": task['status'],
+                                    "progress": task['progress']
+                                })
 async def handle_download(request: web.Request) -> web.FileResponse:
     """Обработчик скачивания готового видео"""
     await verify_api_key(request)
