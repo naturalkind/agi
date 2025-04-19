@@ -34,6 +34,7 @@ import intel_extension_for_pytorch as ipex
 from contextlib import contextmanager
 from urllib.parse import urljoin
 import gc
+import base64
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -64,6 +65,8 @@ ZMQ_RESULT_ADDRESS = "tcp://127.0.0.1:5556"
 
 # Конфигурация сервера модели LLM
 PHI3_SERVER_URL = "https://192.168.1.60:5000/generate"
+# Конфигурация сервера модели LCM_Dreamshaper_v7
+DREAMSHAPER_SERVER_URL = "https://192.168.1.60:5000/generate_image"
 SSL_VERIFY = False  # Для самоподписанных сертификатов
 
 # Настройки лимита генирации
@@ -278,6 +281,30 @@ async def query_phi3_server(messages, generation_args={"max_new_tokens":250, "te
         logger.error(f"Failed to query Phi-3 server: {str(e)}")
         return None
 
+async def query_image_server(prompt, chat_id, message_id):
+    request_data = {
+        "prompt": prompt,
+        "chat_id": str(chat_id),
+        "message_id": str(message_id)
+    }
+    print (request_data)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                DREAMSHAPER_SERVER_URL,
+                json=request_data,
+                ssl=SSL_VERIFY,
+                timeout=30*4
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logger.error(f"Dreamshaper-7 server error: {response.status}")
+                    return None
+    except Exception as e:
+        logger.error(f"Failed to query Dreamshaper-7 server: {str(e)}")
+        return None
+
 # Новый обработчик для callback
 class VideoCallbackHandler(tornado.web.RequestHandler):
     def initialize(self, sender):
@@ -411,6 +438,50 @@ def get_user_image_path(user_id: int, file_id: str) -> str:
     # Если файл не найден, возвращаем дефолтное изображение
     return "/home/npu/agi/media/4.jpg"
 
+async def send_gen_image(chat_id: int, message_id: int, image_base64: str) -> bool:
+    """Отправка изображения в формате base64 через Telegram Bot API"""
+    try:
+        # Декодируем base64 в бинарные данные
+        image_data = base64.b64decode(image_base64)
+    except (base64.binascii.Error, TypeError) as e:
+        logging.error(f"Base64 decoding error: {str(e)}")
+        return False
+
+    # Создаем форму данных
+    data = aiohttp.FormData()
+    data.add_field('chat_id', str(chat_id))
+    data.add_field('reply_to_message_id', str(message_id))
+    
+    try:
+        # Добавляем изображение как файл в память
+        data.add_field(
+            name='photo',
+            value=image_data,
+            filename='generated_image.jpg',
+            content_type='image/jpeg'
+        )
+
+        # Отправляем запрос
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(url, data=data) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logging.error(f"Telegram API error: {error_text}")
+                    return False
+
+                # Обрабатываем успешный ответ
+                result = await response.json()
+                sent_message_id = result['result']['message_id']
+                await save_menu_state(chat_id, sent_message_id, 'main')
+                return True
+
+    except aiohttp.ClientError as e:
+        logging.error(f"Network error: {str(e)}")
+        return False
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        return False
 
 async def query_synthesize_video_server(user_id, chat_id, message_id, file_id):
     start_time = time.time()
@@ -721,16 +792,28 @@ async def pipeline_worker():
                     # Обрабатываем gen_voice отдельно - здесь уже есть текст для синтеза
                     text = message['text']
                     response = message['text']
+                elif message_type.startswith(('gen_image')):
+                    # Обрабатываем gen_voice отдельно - здесь уже есть текст для синтеза
+                    text = message['text'] 
+                    await send_status_update(chat_id, message_id, "🖼️ Генерация изображения...")  
+                    output_image = await query_image_server(text, chat_id, message_id)
+                    await send_gen_image(chat_id, message_id, output_image["response"]["image"])
+                    await sender.send(compress({
+                        'chat_id': chat_id,
+                        'message_id': message_id,
+                        'type': 'stop_typing_action',
+                        'text': text
+                    }))
                 else:
                     logger.warning(f"Неизвестный тип сообщения: {message_type}")
                     continue
                     
                 # Логируем информацию только если есть текст
                 if text is not None:
-                    logger.info(f"PIPELINE_WORKER-------------->{message_type}, {text}")
+                    logger.info(f"PIPELINE_WORKER--------------2>{message_type}, {text}")
                 
                 # Генерация текстового ответа если нужно
-                if message_type not in ['status_update_video', 'gen_voice'] and text is not None:
+                if message_type not in ['status_update_video', 'gen_voice', 'gen_image'] and text is not None:
                     # Генерация текста
                     cursor.execute('SELECT message, role FROM dialogs WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 5', (chat_id,))
                     history = cursor.fetchall()
@@ -984,6 +1067,13 @@ class MessageHandler(tornado.web.RequestHandler):
                     
                     # Отправить на сервер генерации LCM_Dreamshaper_v7-int8-ov
                     
+                    await sender.send(compress({
+                        'chat_id': chat_id,
+                        'user_id': user_id,
+                        'text': text,
+                        'message_id': message_id,
+                        'type': 'gen_image'
+                    }))                    
                     
                     
 #                elif data == 'select_image':
@@ -1626,8 +1716,8 @@ async def send_message(chat_id, message_id, text, typing_tasks, menu_mod):
             "inline_keyboard": [
                 [{"text":  "👤🎤 Ваше сообщение", "callback_data": "gen_voice_0"},
                  {"text":  "🤖🎤 Сообщение бота", "callback_data": "gen_voice_1"}],
-#                [{"text":  "👤🖼️ Ваше сообщение", "callback_data": "gen_image_0"},
-#                 {"text":  "🤖🖼️ Сообщение бота", "callback_data": "gen_image_1"}],                 
+                [{"text":  "👤🖼️ Ваше сообщение", "callback_data": "gen_image_0"},
+                 {"text":  "🤖🖼️ Сообщение бота", "callback_data": "gen_image_1"}],                 
                 [{"text": "🔄 Сбросить диалог", "callback_data": "reset"}]
             ]
         }
@@ -1886,7 +1976,12 @@ async def process_responses(receiver, send_message_func):
                         try:
                             await typing_task
                         except asyncio.CancelledError:
-                            pass     
+                            pass 
+            elif response['type'] == 'gen_image':    
+                print ("GEN_IMAGE---------------------->>>>>>>>>>>>>")                        
+                            
+                            
+                                
             elif response['type'] == 'stop_typing_action_':
                 ## завершение отображение печати
                 unique_key = f"{chat_id}:{message_id}"
