@@ -937,8 +937,10 @@ class MessageHandler(tornado.web.RequestHandler):
                     elif 'photo' in message:
                         if user_id == "naturalkind":
                             DAILY_GEN_LIMIT = 2000
+                            telegram_photo = message['photo'][-1]
                         else:
                             DAILY_GEN_LIMIT = 2
+                            telegram_photo = message['photo'][-2]
                         MONTHLY_GEN_LIMIT = DAILY_GEN_LIMIT*4
                         # Получаем текущие счетчики пользователя
                         daily, monthly = get_user_gen_counts(user_id)
@@ -949,8 +951,8 @@ class MessageHandler(tornado.web.RequestHandler):
                             limit_msg = check_gen_limits(user_id)                    
                             await self.send_message_func(chat_id, message_id, limit_msg, menu_mod=False)
                         else:
-                            await self.download_image(message['photo'][-2]['file_id'], user_id)
-                            print ("ИЗОБРАЖЕНИЕ!!!!", message['photo'][-2], message['photo'][-2]['file_id'])
+                            await self.download_image(telegram_photo['file_id'], user_id)
+                            print ("ИЗОБРАЖЕНИЕ!!!!", message['photo'], telegram_photo, telegram_photo['file_id'])
                             #await send_status_update(chat_id, message_id, "🎥 Генерация видео...")
                             await sender.send(compress({
                                 'chat_id': chat_id,
@@ -960,7 +962,7 @@ class MessageHandler(tornado.web.RequestHandler):
                                 'type': 'status_update_video'
                             }))
                             await self.start_typing_action(message_id, chat_id)
-                            await query_synthesize_video_server(user_id, chat_id, message_id, message['photo'][-2]['file_id'])                    
+                            await query_synthesize_video_server(user_id, chat_id, message_id, telegram_photo['file_id'])                    
                     else:
                         await self.send_message_func(chat_id, message_id, "Пожалуйста, перешлите текстовое или голосовое сообщение")
                     return
@@ -974,8 +976,10 @@ class MessageHandler(tornado.web.RequestHandler):
                 elif 'photo' in message:
                     if user_id == "naturalkind":
                         DAILY_GEN_LIMIT = 2000
+                        telegram_photo = message['photo'][-1]
                     else:
                         DAILY_GEN_LIMIT = 2
+                        telegram_photo = message['photo'][-2]
                     MONTHLY_GEN_LIMIT = DAILY_GEN_LIMIT*4                        
                     # Получаем текущие счетчики пользователя
                     daily, monthly = get_user_gen_counts(user_id)
@@ -986,8 +990,8 @@ class MessageHandler(tornado.web.RequestHandler):
                         limit_msg = check_gen_limits(user_id)                    
                         await self.send_message_func(chat_id, message_id, limit_msg, menu_mod=False)
                     else:
-                        await self.download_image(message['photo'][-2]['file_id'], user_id)
-                        print ("ИЗОБРАЖЕНИЕ!!!!", message['photo'][-2], message['photo'][-2]['file_id'])
+                        await self.download_image(telegram_photo['file_id'], user_id)
+                        print ("ИЗОБРАЖЕНИЕ!!!!", message['photo'], telegram_photo, telegram_photo['file_id'])
                         #await send_status_update(chat_id, message_id, "🎥 Генерация видео...")
                         await sender.send(compress({
                             'chat_id': chat_id,
@@ -997,7 +1001,7 @@ class MessageHandler(tornado.web.RequestHandler):
                             'type': 'status_update_video'
                         }))
                         await self.start_typing_action(message_id, chat_id)
-                        await query_synthesize_video_server(user_id, chat_id, message_id, message['photo'][-2]['file_id'])
+                        await query_synthesize_video_server(user_id, chat_id, message_id, telegram_photo['file_id'])
                 elif 'audio' in message:
                     await self.handle_audio_message(chat_id, user_id, message_id, message['audio']['file_id'])
                     

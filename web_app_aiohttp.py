@@ -539,7 +539,7 @@ async def process_video_task(app: web.Application, task_id: str):
         img_size = (config.data.source_image.width, config.data.source_image.height)
         clip_length = config.data.n_sample_frames
         face_analysis_model_path = config.face_analysis.model_path
-        
+        print ("CLIP_LENGTH", clip_length)
         try:
             with ImageProcessor(img_size, face_analysis_model_path) as image_processor:
                 source_image_pixels, \
@@ -688,7 +688,7 @@ async def process_video_task(app: web.Application, task_id: str):
         tensor_result = tensor_result[:, :audio_length]
 
         # 5. Save the result
-        print ("SAVE THE RESULT----------->", output_path, str(task['audio']), _test_time_end) # 415.62347054481506
+        print (f"IMG SIZE: {img_size_orig} SAVE THE RESULT----------->", output_path, str(task['audio']), _test_time_end) # 415.62347054481506
         tensor_to_video(tensor_result, str(output_path), str(task['audio']), img_size_orig)
         torch.cuda.empty_cache() 
         # Обновление статуса
