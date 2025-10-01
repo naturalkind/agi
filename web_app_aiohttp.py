@@ -32,6 +32,63 @@ from hallo.models.unet_3d import UNet3DConditionModel
 from hallo.utils.config import filter_non_none
 from hallo.utils.util import tensor_to_video
 
+### hallo.utils.util
+def tensor_to_video(tensor, output_video_file, audio_source, img_size_orig, fps=25):
+    """
+    Simplified version that automatically handles dimension issues.
+    Fixed scaling for wide format images.
+    """
+    import numpy as np
+    from moviepy.editor import VideoClip, AudioFileClip
+    import cv2
+    
+    # Convert tensor to numpy array [f, h, w, c]
+    tensor = tensor.permute(1, 2, 3, 0).cpu().numpy()
+    tensor = np.clip(tensor * 255, 0, 255).astype(np.uint8)
+    
+    # Ensure original image size is divisible by 2
+    target_width = (img_size_orig[0] // 2) * 2
+    target_height = (img_size_orig[1] // 2) * 2
+    
+    def make_frame(t):
+        frame_index = min(int(t * fps), tensor.shape[0] - 1)
+        frame = tensor[frame_index]
+        
+        # Resize frame to exact target dimensions WITHOUT preserving aspect ratio
+        # This will stretch the image to fill the entire frame
+        resized = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
+        
+        return resized
+    
+    duration = tensor.shape[0] / fps
+    video_clip = VideoClip(make_frame, duration=duration)
+    
+    try:
+        audio_clip = AudioFileClip(audio_source).subclip(0, duration)
+        video_clip = video_clip.set_audio(audio_clip)
+    except Exception as e:
+        print(f"Warning: Could not add audio: {e}")
+    
+    # Critical: Use these specific settings for H.264 compatibility
+    video_clip.write_videofile(
+        output_video_file,
+        fps=fps,
+        codec='libx264',
+        audio_codec='aac',
+        bitrate='5000k',
+        preset='medium',
+        ffmpeg_params=[
+            '-pix_fmt', 'yuv420p',  # This is crucial
+            '-profile:v', 'baseline',
+            '-level', '3.0',
+            '-movflags', '+faststart'
+        ]
+    )
+    
+    video_clip.close()
+    if 'audio_clip' in locals():
+        audio_clip.close()
+
 
 # Настройка логгера
 logging.basicConfig(

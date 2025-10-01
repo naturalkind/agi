@@ -33,7 +33,7 @@ class TelegramWebhookManager:
 telegram_manager = TelegramWebhookManager(BOT_TOKEN, "YOURPUBLIC.pem")
 webhook_url = "https://178.158.131.41:8443"
 
-#print (telegram_manager.set_webhook(webhook_url))
+print (telegram_manager.set_webhook(webhook_url))
 print (telegram_manager.get_webhook_info())
 #print (telegram_manager.delete_webhook()) # Uncomment to delete the webhook
 #server	 *	 8443	 192.168.1.50	 	 TCP

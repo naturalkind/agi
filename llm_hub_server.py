@@ -35,6 +35,17 @@ from contextlib import contextmanager
 from urllib.parse import urljoin
 import gc
 import base64
+import uuid
+
+# Kandensky
+TOPIC = 'snaptravel'
+RECEIVE_PORT = 5556      # Сервер получает задачи на этом порту
+CLIENT_SEND_PORT = 5555  # Сервер отправляет результаты клиентам на этом порту
+
+# Глобальные переменные для ZMQ
+work_publisher = None
+context = None
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -64,9 +75,9 @@ ZMQ_PIPELINE_ADDRESS = "tcp://127.0.0.1:5555"
 ZMQ_RESULT_ADDRESS = "tcp://127.0.0.1:5556"
 
 # Конфигурация сервера модели LLM
-PHI3_SERVER_URL = "https://192.168.1.60:5000/generate"
+PHI3_SERVER_URL = "https://192.168.1.50:5000/generate"
 # Конфигурация сервера модели LCM_Dreamshaper_v7
-DREAMSHAPER_SERVER_URL = "https://192.168.1.60:5000/generate_image"
+DREAMSHAPER_SERVER_URL = "https://192.168.1.50:6000/generate_image"
 SSL_VERIFY = False  # Для самоподписанных сертификатов
 
 # Настройки лимита генирации
@@ -257,20 +268,57 @@ def synthesize_speech(text, model, config, user_id):
     sf.write(wav_path, np.concatenate(wav_chunks), samplerate=config.audio.output_sample_rate)
     return wav_path
 
-async def query_phi3_server(messages, generation_args={"max_new_tokens":250, "temperature":0.0}):
+# INTEL VERSION PHI
+#async def llm_server(messages, generation_args={"max_new_tokens":250, "temperature":0.0}):
+#    request_data = {
+#        "messages": messages,
+#        "max_new_tokens": generation_args.get("max_new_tokens", 250),
+#        "temperature": generation_args.get("temperature", 0.0)
+#    }
+#    
+#    try:
+#        async with aiohttp.ClientSession() as session:
+#            async with session.post(
+#                PHI3_SERVER_URL,
+#                json=request_data,
+#                ssl=SSL_VERIFY,
+#                timeout=30*4
+#            ) as response:
+#                if response.status == 200:
+#                    return await response.json()
+#                else:
+#                    logger.error(f"Phi-3 server error: {response.status}")
+#                    return None
+#    except Exception as e:
+#        logger.error(f"Failed to query Phi-3 server: {str(e)}")
+#        return None
+
+async def llm_server(messages, generation_args={"max_new_tokens":400, "temperature":0.7}):
+    # Создаем SSL контекст аналогично примеру download_video
+    ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
+    ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
+    ssl_context.check_hostname = True
+    ssl_context.verify_mode = ssl.CERT_REQUIRED
+    
+    # Добавляем заголовки аналогично примеру
+    headers = {"X-API-Key": "default-api-key-change-me"}
+    
     request_data = {
         "messages": messages,
-        "max_new_tokens": generation_args.get("max_new_tokens", 250),
-        "temperature": generation_args.get("temperature", 0.0)
+        "max_new_tokens": generation_args.get("max_new_tokens", 400),
+        "temperature": generation_args.get("temperature", 0.7)
     }
     
     try:
-        async with aiohttp.ClientSession() as session:
+        # Создаем ClientSession с SSL контекстом аналогично примеру
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=ssl_context)
+        ) as session:
             async with session.post(
                 PHI3_SERVER_URL,
                 json=request_data,
-                ssl=SSL_VERIFY,
-                timeout=30*4
+                headers=headers,
+                timeout=60*8
             ) as response:
                 if response.status == 200:
                     return await response.json()
@@ -281,29 +329,236 @@ async def query_phi3_server(messages, generation_args={"max_new_tokens":250, "te
         logger.error(f"Failed to query Phi-3 server: {str(e)}")
         return None
 
+
+
+###################
+#### Kandensky
+###################
+
+def initialize_zmq():
+    """Инициализация ZMQ сокетов"""
+    global work_publisher, context
+    if work_publisher is None:
+        context = zmq.Context()
+        
+        # Сокет для отправки задач
+        work_publisher = context.socket(zmq.PUB)
+        work_publisher.connect(f'tcp://192.168.1.50:{RECEIVE_PORT}')  # Подключаемся к порту получения задач сервера
+        
+        print("ZMQ initialized for client")
+
+def send_task(task_data, model='Dreamshaper-7', topic=TOPIC):
+    """Отправка задачи на сервер"""
+    initialize_zmq()
+    
+    task_id = str(uuid.uuid4())
+    message = {
+        'body': task_data["prompt"],
+        'model': model, 
+        'id': task_id,
+        'chat_id': task_data.get("chat_id", ""),
+        'message_id': task_data.get("message_id", "")
+    }
+    
+    compressed_message = compress(message)
+    work_publisher.send(f'{topic} '.encode('utf8') + compressed_message)
+    print(f"Task {task_id} sent to server")
+    return task_id
+
+def wait_for_result(task_id, topic=TOPIC, timeout=120):
+    """Ожидание результата от сервера"""
+    # Создаем подписчик для получения результатов
+    result_subscriber = context.socket(zmq.SUB)
+    result_subscriber.setsockopt(zmq.SUBSCRIBE, topic.encode('utf8'))
+    result_subscriber.connect(f'tcp://192.168.1.50:{CLIENT_SEND_PORT}')  # Подключаемся к порту отправки результатов сервера
+    result_subscriber.setsockopt(zmq.RCVTIMEO, 100)  # Таймаут 100ms для проверки
+    
+    print(f"Waiting for result {task_id}...")
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        try:
+            message = result_subscriber.recv()
+            # Парсим сообщение
+            compressed_json = message[len(topic) + 1:]
+            result = decompress(compressed_json)
+            
+            if result.get('id') == task_id:
+                result_subscriber.close()
+                print(f"Received result for {task_id}")
+                return result
+                
+        except zmq.Again:
+            # Таймаут, продолжаем ждать
+            continue
+        except Exception as e:
+            print(f"Error receiving message: {e}")
+            continue
+    
+    result_subscriber.close()
+    raise TimeoutError(f"Timeout waiting for result {task_id}")
+
+def pil_to_base64(pil_image, format='JPEG'):
+    """
+    Преобразует изображение PIL в base64 строку без сохранения на диск.
+    
+    :param pil_image: Объект изображения PIL
+    :param format: Формат для сохранения ('JPEG', 'PNG' и т.д.)
+    :return: Закодированная строка base64
+    """
+    buffered = BytesIO()
+    pil_image.save(buffered, format=format)
+    img_bytes = buffered.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+    return img_base64
+
+async def process_image_task_result(task_data, result):
+    """Асинхронная обработка результата задачи для изображений"""
+    if result.get('error'):
+        error_msg = result.get('error_msg', 'Unknown error')
+        raise Exception(f"Server error: {error_msg}")
+    
+    task_id = result['id']
+    
+    try:
+        # Сохраняем изображение (адаптируйте под вашу логику)
+        filename = f'{task_id}.jpg'
+        
+        if 'prediction' in result and len(result['prediction']) > 0:
+            # Сохраняем изображение в нужную директорию
+            # ВАЖНО: Укажите правильный путь для сохранения изображений
+            image_path = f'/path/to/your/images/{filename}'
+            result['prediction'][0].save(image_path, format="JPEG")
+            print(f"Image saved to {image_path}")
+        
+        
+        print(f"Image processing completed for {task_id}")
+        return {
+            "status": "completed",
+            "task_id": task_id,
+            "filename": filename,
+            "image_url": f"/images/{filename}"  # или полный URL
+        }
+        
+    except Exception as e:
+        print(f"Error processing image result: {e}")
+        raise
+
 async def query_image_server(prompt, chat_id, message_id):
-    request_data = {
+    """Основная асинхронная функция для запроса генерации изображения"""
+    task_data = {
         "prompt": prompt,
         "chat_id": str(chat_id),
         "message_id": str(message_id)
     }
-    print (request_data)
+    
+    print(f"Sending image generation task: {task_data}")
+    
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                DREAMSHAPER_SERVER_URL,
-                json=request_data,
-                ssl=SSL_VERIFY,
-                timeout=30*4
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    logger.error(f"Dreamshaper-7 server error: {response.status}")
-                    return None
+        # Отправляем задачу (синхронная операция в отдельном потоке)
+        task_id = await asyncio.to_thread(send_task, task_data)
+        
+        # Ждем результат (синхронная операция в отдельном потоке)
+        result = await asyncio.to_thread(wait_for_result, task_id)
+        
+        # Обрабатываем результат асинхронно
+        processed_result = await process_image_task_result(task_data, result)
+        return processed_result
+        
+    except TimeoutError as e:
+        logger.error(f"Timeout waiting for image generation: {str(e)}")
+        return {
+            "status": "error",
+            "error": f"Timeout waiting for image generation: {str(e)}"
+        }
     except Exception as e:
-        logger.error(f"Failed to query Dreamshaper-7 server: {str(e)}")
-        return None
+        logger.error(f"Failed to query image server: {str(e)}")
+        return {
+            "status": "error", 
+            "error": str(e)
+        }
+
+# Дополнительная функция для проверки соединения
+async def check_server_connection():
+    """Проверка соединения с ZMQ сервером"""
+    try:
+        initialize_zmq()
+        
+        # Пробуем отправить тестовое сообщение
+        test_task_id = send_task({"prompt": "test", "chat_id": "test", "message_id": "test"})
+        print("Connection test successful. Server is reachable")
+        return True
+    except Exception as e:
+        logger.error(f"Cannot connect to ZMQ server: {str(e)}")
+        return False
+        
+    
+# Упрощенная версия без сохранения файлов (если нужно только получить изображение)
+async def query_image_server_simple(prompt, chat_id, message_id):
+    """Упрощенная версия без сложной обработки"""
+    task_data = {
+        "prompt": prompt,
+        "chat_id": str(chat_id),
+        "message_id": str(message_id)
+    }
+    
+    try:
+        # Отправляем задачу и ждем результат
+        task_id = await asyncio.to_thread(send_task, task_data)
+        result = await asyncio.to_thread(wait_for_result, task_id)
+        
+        if result.get('error'):
+            return {
+                "status": "error",
+                "error": result.get('error_msg', 'Unknown error')
+            }
+        image =  result.get('prediction', [])
+        base64_string = pil_to_base64(image[0], format='JPEG')
+        print (base64_string[:10], type(base64_string))
+        return {
+            "status": "completed",
+            "task_id": result['id'],
+            "images": base64_string
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to query image server: {str(e)}")
+        return {
+            "status": "error", 
+            "error": str(e)
+        }
+        
+initialize_zmq()
+        
+        
+###################
+#### END Kandensky
+###################
+
+
+#async def query_image_server(prompt, chat_id, message_id):
+#    request_data = {
+#        "prompt": prompt,
+#        "chat_id": str(chat_id),
+#        "message_id": str(message_id)
+#    }
+#    print (request_data)
+#    try:
+#        async with aiohttp.ClientSession() as session:
+#            async with session.post(
+#                DREAMSHAPER_SERVER_URL,
+#                json=request_data,
+#                ssl=SSL_VERIFY,
+#                timeout=30*4
+#            ) as response:
+#                if response.status == 200:
+#                    return await response.json()
+#                else:
+#                    logger.error(f"Dreamshaper-7 server error: {response.status}")
+#                    return None
+#    except Exception as e:
+#        logger.error(f"Failed to query Dreamshaper-7 server: {str(e)}")
+#        return None
 
 # Новый обработчик для callback
 class VideoCallbackHandler(tornado.web.RequestHandler):
@@ -367,7 +622,7 @@ class VideoCallbackHandler(tornado.web.RequestHandler):
             
             print ("WORK VIDEOCALLBACKHANDLER", data, chat_id, message_id)
             if status == 'completed':
-                video_url = urljoin('https://192.168.1.50:5000/', data['download_url'])
+                video_url = urljoin('https://192.168.1.50:6000/', data['download_url'])
                 await self.send_video_to_telegram(chat_id, message_id, video_url)
                 
                 # Удаляем временные данные
@@ -446,12 +701,12 @@ async def send_gen_image(chat_id: int, message_id: int, image_base64: str) -> bo
     except (base64.binascii.Error, TypeError) as e:
         logging.error(f"Base64 decoding error: {str(e)}")
         return False
-
+    
     # Создаем форму данных
     data = aiohttp.FormData()
     data.add_field('chat_id', str(chat_id))
     data.add_field('reply_to_message_id', str(message_id))
-    
+    print (type(image_base64))
     try:
         # Добавляем изображение как файл в память
         data.add_field(
@@ -484,69 +739,95 @@ async def send_gen_image(chat_id: int, message_id: int, image_base64: str) -> bo
         return False
 
 async def query_synthesize_video_server(user_id, chat_id, message_id, file_id):
+    # Запускаем таймер для отслеживания общего времени выполнения
     start_time = time.time()
-    timeout = 600  # 10 minutes in seconds
-    retry_delay = 5  # Start with 5 seconds between retry attempts
-    max_retry_delay = 30  # Maximum delay between retries
+    # Максимальное время ожидания - 10 минут
+    timeout = 600  # 10 минут в секундах
+    # Начальная задержка между повторными попытками
+    retry_delay = 5  # Начинаем с 5 секунд между попытками
+    # Максимальная задержка между повторными попытками
+    max_retry_delay = 30  # Максимальная задержка между попытками
     
+    # Выполняем попытки подключения, пока не истечет время ожидания
     while time.time() - start_time < timeout:
         try:
-            # Получаем текущий режим голоса
+            # Получаем текущий режим голоса из Redis
             voice_mode = redis_client.get(f"voice_mode:{user_id}") or b"neural"
+            # Декодируем байтовую строку в обычную строку
             voice_mode = voice_mode.decode()
+            # Выводим отладочную информацию о текущем режиме голоса
             print("QUERY_SYNTHESIZE_VIDEO_SERVER!!!!!!!!!!!!------------", voice_mode)
             
-            # Выбираем соответствующий аудиофайл
+            # Выбираем соответствующий аудиофайл в зависимости от режима голоса
             if voice_mode == "user":
+                # Если используется голос пользователя, берем его образец
                 audio_path = f"data_users/speaker_reference_{user_id}.wav"
             else:
+                # Иначе используем сгенерированный клонированный голос
                 audio_path = f"data_users/{user_id}_clon_out.wav"
             
+            # Получаем путь к изображению пользователя
             image_path = get_user_image_path(user_id, file_id)
             
-            callback_url = "https://192.168.1.50:8443/video_callback"  # Ваш внешний URL
+            # URL для обратного вызова, куда сервер отправит результат после обработки
+            callback_url = "https://192.168.1.50:8443/video_callback"  # Внешний URL для обратного вызова
             
+            # Настраиваем SSL-контекст для защищенного соединения
             ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
             ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
             
+            # Формируем данные для отправки на сервер
             data = aiohttp.FormData()
+            # Добавляем аудиофайл
             data.add_field('audio', open(audio_path, 'rb'), filename='audio.wav')
+            # Добавляем изображение
             data.add_field('image', open(image_path, 'rb'), filename=f'speaker_reference_{user_id}_{file_id}.jpg')
+            # Добавляем параметры для генерации видео
             data.add_field('video_params', json.dumps({"pose_weight": 1.0}))
+            # Добавляем URL для обратного вызова
             data.add_field('callback_url', callback_url)
             
+            # Создаем сессию с настроенным SSL-контекстом
             async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-                async with session.post('https://192.168.1.50:5000/generate_video', data=data) as resp:
+                # Отправляем POST-запрос на сервер генерации видео
+                async with session.post('https://192.168.1.50:6000/generate_video', data=data) as resp:
+                    # Если запрос успешен (статус 200)
                     if resp.status == 200:
+                        # Получаем результат в формате JSON
                         result = await resp.json()
+                        # Извлекаем ID задачи
                         task_id = result.get('task_id')
-                        # Сохраняем связь задачи с чатом
+                        # Сохраняем связь задачи с чатом в Redis
                         redis_client.setex(
-                            f"video_task:{task_id}",
-                            3600*3,  # 3 часа
-                            json.dumps({
+                            f"video_task:{task_id}",  # Ключ для хранения в Redis
+                            3600*100,  # Время жизни ключа - 100 часов
+                            json.dumps({  # Сохраняем данные в формате JSON
                                 'chat_id': chat_id,
                                 'message_id': message_id,
                                 'user_id': user_id
                             })
                         )
+                        # Возвращаем ID задачи
                         return task_id
                     else:
+                        # Если статус не 200, логируем предупреждение и повторяем попытку
                         logger.warning(f"Video server responded with status: {resp.status}, retrying in {retry_delay} seconds...")
                         
         except (aiohttp.ClientError, ConnectionError, TimeoutError) as e:
+            # Обрабатываем ошибки соединения
             logger.warning(f"Connection error: {str(e)}, retrying in {retry_delay} seconds...")
         except Exception as e:
+            # Обрабатываем другие ошибки
             logger.error(f"Video task creation failed: {str(e)}")
-            # For non-connection errors, we don't retry
+            # Для не связанных с подключением ошибок не повторяем попытки
             return None
             
-        # Wait before retrying
+        # Ожидаем перед повторной попыткой
         await asyncio.sleep(retry_delay)
-        # Implement exponential backoff (increasing the delay between retries)
+        # Реализуем экспоненциальную задержку (увеличиваем время между повторными попытками)
         retry_delay = min(retry_delay * 1.5, max_retry_delay)
     
-    # If we've exhausted our retry attempts
+    # Если исчерпали все попытки повторного подключения
     logger.error(f"Failed to connect to video server after trying for {timeout} seconds")
     return None
 
@@ -796,8 +1077,9 @@ async def pipeline_worker():
                     # Обрабатываем gen_voice отдельно - здесь уже есть текст для синтеза
                     text = message['text'] 
                     await send_status_update(chat_id, message_id, "🖼️ Генерация изображения...")  
-                    output_image = await query_image_server(text, chat_id, message_id)
-                    await send_gen_image(chat_id, message_id, output_image["response"]["image"])
+                    output_image = await query_image_server_simple(text, chat_id, message_id)
+                    ##print ("OUTPUT_IMAGe-------->", output_image)
+                    await send_gen_image(chat_id, message_id, output_image['images'])
                     await sender.send(compress({
                         'chat_id': chat_id,
                         'message_id': message_id,
@@ -822,7 +1104,7 @@ async def pipeline_worker():
                     messages.append({"role": "user", "content": text})
                     await send_status_update(chat_id, message_id, "🧠 Генерация ответа...")
                     
-                    output = await query_phi3_server(messages) 
+                    output = await llm_server(messages) 
                     if output is None:
                         response = "⚠️ Ошибка при обработке запроса. Попробуйте позже."
                     else:
@@ -1771,7 +2053,7 @@ async def send_message(chat_id, message_id, text, typing_tasks, menu_mod):
     else:
         ## Отправляем начало сообщения с кнопкой
         pre_text = text[:code_start] if 0 < code_start < 4096 else text[:50]
-        await send_message(chat_id, message_id, f"Ответ слишком большой: {pre_text}...", typing_tasks)
+        await send_message(chat_id, message_id, f"Ответ слишком большой: {pre_text}...", typing_tasks, menu_mod=True)
         
         ## Отправляем файл
         file = StringIO(text)
