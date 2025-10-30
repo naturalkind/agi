@@ -76,8 +76,8 @@ ZMQ_RESULT_ADDRESS = "tcp://127.0.0.1:5556"
 
 # Конфигурация сервера модели LLM
 PHI3_SERVER_URL = "https://192.168.1.50:5000/generate"
-# Конфигурация сервера модели LCM_Dreamshaper_v7
-DREAMSHAPER_SERVER_URL = "https://192.168.1.50:6000/generate_image"
+# Конфигурация сервера OCR
+OCR_SERVER_URL = "https://192.168.1.50:5001/ocr"
 SSL_VERIFY = False  # Для самоподписанных сертификатов
 
 # Настройки лимита генирации
@@ -144,22 +144,6 @@ def check_gen_limits(user_id: int) -> str | None:
         return "⚠️ Месячный лимит генераций исчерпан. Доступ откроется в следующем месяце"
     
     return None
-
-# Предполагается, что redis_client уже инициализирован
-def reset_video_tasks():
-    try:
-        # Используем scan_iter для эффективного перебора ключей по шаблону
-        for key in redis_client.scan_iter("video_task:*"):
-            redis_client.delete(key)
-            print(f"Удален ключ: {key}")
-        print("Все задачи видео синтеза сброшены.")
-    except Exception as e:
-        print(f"Произошла ошибка при сбросе задач: {e}")
-
-# Вызов функции
-reset_video_tasks()
-
-#----------------------->
 
 def get_user_word_counts(user_id: int) -> tuple[int, int]:
     daily = int(redis_client.get(f"{REDIS_DAILY_PREFIX}{user_id}") or 0)
@@ -283,30 +267,6 @@ def synthesize_speech(text, model, config, user_id):
     return wav_path
 
 # INTEL VERSION PHI
-#async def llm_server(messages, generation_args={"max_new_tokens":250, "temperature":0.0}):
-#    request_data = {
-#        "messages": messages,
-#        "max_new_tokens": generation_args.get("max_new_tokens", 250),
-#        "temperature": generation_args.get("temperature", 0.0)
-#    }
-#    
-#    try:
-#        async with aiohttp.ClientSession() as session:
-#            async with session.post(
-#                PHI3_SERVER_URL,
-#                json=request_data,
-#                ssl=SSL_VERIFY,
-#                timeout=30*4
-#            ) as response:
-#                if response.status == 200:
-#                    return await response.json()
-#                else:
-#                    logger.error(f"Phi-3 server error: {response.status}")
-#                    return None
-#    except Exception as e:
-#        logger.error(f"Failed to query Phi-3 server: {str(e)}")
-#        return None
-
 async def llm_server(messages, generation_args={"max_new_tokens":400, "temperature":0.7}):
     # Создаем SSL контекст аналогично примеру download_video
     ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
@@ -343,356 +303,164 @@ async def llm_server(messages, generation_args={"max_new_tokens":400, "temperatu
         logger.error(f"Failed to query Phi-3 server: {str(e)}")
         return None
 
-
-
 ###################
-#### Kandensky
+#### OCR Server
 ###################
 
-def initialize_zmq():
-    """Инициализация ZMQ сокетов"""
-    global work_publisher, context
-    if work_publisher is None:
-        context = zmq.Context()
-        
-        # Сокет для отправки задач
-        work_publisher = context.socket(zmq.PUB)
-        work_publisher.connect(f'tcp://192.168.1.50:{RECEIVE_PORT}')  # Подключаемся к порту получения задач сервера
-        
-        print("ZMQ initialized for client")
-
-def send_task(task_data, model='Dreamshaper-7', topic=TOPIC):
-    """Отправка задачи на сервер"""
-    initialize_zmq()
-    
-    task_id = str(uuid.uuid4())
-    message = {
-        'body': task_data["prompt"],
-        'model': model, 
-        'id': task_id,
-        'chat_id': task_data.get("chat_id", ""),
-        'message_id': task_data.get("message_id", "")
-    }
-    
-    compressed_message = compress(message)
-    work_publisher.send(f'{topic} '.encode('utf8') + compressed_message)
-    print(f"Task {task_id} sent to server")
-    return task_id
-
-def wait_for_result(task_id, topic=TOPIC, timeout=120):
-    """Ожидание результата от сервера"""
-    # Создаем подписчик для получения результатов
-    result_subscriber = context.socket(zmq.SUB)
-    result_subscriber.setsockopt(zmq.SUBSCRIBE, topic.encode('utf8'))
-    result_subscriber.connect(f'tcp://192.168.1.50:{CLIENT_SEND_PORT}')  # Подключаемся к порту отправки результатов сервера
-    result_subscriber.setsockopt(zmq.RCVTIMEO, 100)  # Таймаут 100ms для проверки
-    
-    print(f"Waiting for result {task_id}...")
-    start_time = time.time()
-    
-    while time.time() - start_time < timeout:
-        try:
-            message = result_subscriber.recv()
-            # Парсим сообщение
-            compressed_json = message[len(topic) + 1:]
-            result = decompress(compressed_json)
-            
-            if result.get('id') == task_id:
-                result_subscriber.close()
-                print(f"Received result for {task_id}")
-                return result
-                
-        except zmq.Again:
-            # Таймаут, продолжаем ждать
-            continue
-        except Exception as e:
-            print(f"Error receiving message: {e}")
-            continue
-    
-    result_subscriber.close()
-    raise TimeoutError(f"Timeout waiting for result {task_id}")
-
-def pil_to_base64(pil_image, format='JPEG'):
+async def query_ocr_server(user_id, chat_id, message_id, file_id):
     """
-    Преобразует изображение PIL в base64 строку без сохранения на диск.
-    
-    :param pil_image: Объект изображения PIL
-    :param format: Формат для сохранения ('JPEG', 'PNG' и т.д.)
-    :return: Закодированная строка base64
+    Отправляет изображение на OCR сервер для распознавания текста
     """
-    buffered = BytesIO()
-    pil_image.save(buffered, format=format)
-    img_bytes = buffered.getvalue()
-    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-    return img_base64
-
-async def process_image_task_result(task_data, result):
-    """Асинхронная обработка результата задачи для изображений"""
-    if result.get('error'):
-        error_msg = result.get('error_msg', 'Unknown error')
-        raise Exception(f"Server error: {error_msg}")
-    
-    task_id = result['id']
-    
     try:
-        # Сохраняем изображение (адаптируйте под вашу логику)
-        filename = f'{task_id}.jpg'
+        # Получаем путь к изображению пользователя
+        image_path = get_user_image_path(user_id, file_id)
         
-        if 'prediction' in result and len(result['prediction']) > 0:
-            # Сохраняем изображение в нужную директорию
-            # ВАЖНО: Укажите правильный путь для сохранения изображений
-            image_path = f'/path/to/your/images/{filename}'
-            result['prediction'][0].save(image_path, format="JPEG")
-            print(f"Image saved to {image_path}")
-        
-        
-        print(f"Image processing completed for {task_id}")
-        return {
-            "status": "completed",
-            "task_id": task_id,
-            "filename": filename,
-            "image_url": f"/images/{filename}"  # или полный URL
-        }
-        
-    except Exception as e:
-        print(f"Error processing image result: {e}")
-        raise
-
-async def query_image_server(prompt, chat_id, message_id):
-    """Основная асинхронная функция для запроса генерации изображения"""
-    task_data = {
-        "prompt": prompt,
-        "chat_id": str(chat_id),
-        "message_id": str(message_id)
-    }
-    
-    print(f"Sending image generation task: {task_data}")
-    
-    try:
-        # Отправляем задачу (синхронная операция в отдельном потоке)
-        task_id = await asyncio.to_thread(send_task, task_data)
-        
-        # Ждем результат (синхронная операция в отдельном потоке)
-        result = await asyncio.to_thread(wait_for_result, task_id)
-        
-        # Обрабатываем результат асинхронно
-        processed_result = await process_image_task_result(task_data, result)
-        return processed_result
-        
-    except TimeoutError as e:
-        logger.error(f"Timeout waiting for image generation: {str(e)}")
-        return {
-            "status": "error",
-            "error": f"Timeout waiting for image generation: {str(e)}"
-        }
-    except Exception as e:
-        logger.error(f"Failed to query image server: {str(e)}")
-        return {
-            "status": "error", 
-            "error": str(e)
-        }
-
-# Дополнительная функция для проверки соединения
-async def check_server_connection():
-    """Проверка соединения с ZMQ сервером"""
-    try:
-        initialize_zmq()
-        
-        # Пробуем отправить тестовое сообщение
-        test_task_id = send_task({"prompt": "test", "chat_id": "test", "message_id": "test"})
-        print("Connection test successful. Server is reachable")
-        return True
-    except Exception as e:
-        logger.error(f"Cannot connect to ZMQ server: {str(e)}")
-        return False
-        
-    
-# Упрощенная версия без сохранения файлов (если нужно только получить изображение)
-async def query_image_server_simple(prompt, chat_id, message_id):
-    """Упрощенная версия без сложной обработки"""
-    task_data = {
-        "prompt": prompt,
-        "chat_id": str(chat_id),
-        "message_id": str(message_id)
-    }
-    
-    try:
-        # Отправляем задачу и ждем результат
-        task_id = await asyncio.to_thread(send_task, task_data)
-        result = await asyncio.to_thread(wait_for_result, task_id)
-        
-        if result.get('error'):
-            return {
-                "status": "error",
-                "error": result.get('error_msg', 'Unknown error')
-            }
-        image =  result.get('prediction', [])
-        base64_string = pil_to_base64(image[0], format='JPEG')
-        print (base64_string[:10], type(base64_string))
-        return {
-            "status": "completed",
-            "task_id": result['id'],
-            "images": base64_string
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to query image server: {str(e)}")
-        return {
-            "status": "error", 
-            "error": str(e)
-        }
-        
-initialize_zmq()
-        
-        
-###################
-#### END Kandensky
-###################
-
-
-#async def query_image_server(prompt, chat_id, message_id):
-#    request_data = {
-#        "prompt": prompt,
-#        "chat_id": str(chat_id),
-#        "message_id": str(message_id)
-#    }
-#    print (request_data)
-#    try:
-#        async with aiohttp.ClientSession() as session:
-#            async with session.post(
-#                DREAMSHAPER_SERVER_URL,
-#                json=request_data,
-#                ssl=SSL_VERIFY,
-#                timeout=30*4
-#            ) as response:
-#                if response.status == 200:
-#                    return await response.json()
-#                else:
-#                    logger.error(f"Dreamshaper-7 server error: {response.status}")
-#                    return None
-#    except Exception as e:
-#        logger.error(f"Failed to query Dreamshaper-7 server: {str(e)}")
-#        return None
-
-# Новый обработчик для callback
-class VideoCallbackHandler(tornado.web.RequestHandler):
-    def initialize(self, sender):
-        self.sender = sender   
-         
-    async def get(self):
-        try:
-            data = json.loads(self.request.body)
-            print ("GET---", data)
-            task_id = data['task_id']
-            status = data['status']
-            # Получаем связанные данные из Redis
-            task_data = redis_client.get(f"video_task:{task_id}")
-            if not task_data:
-                return
-                
-            task_data = json.loads(task_data)
-            chat_id = task_data['chat_id']
-            message_id = task_data['message_id']
-            user_id = task_data['user_id']
-            if status == "error":
-                #await send_message(chat_id, message_id, "Ошибка, лицо не подходит", task_data)
-                await update_status_message(chat_id, message_id, "Ошибка, лицо не подходит")
-                # Удаляем временные данные
-                redis_client.delete(f"video_task:{task_id}")
-                unique_key = f"{chat_id}:{message_id}"
-                ## завершение отображение печати
-                if unique_key in typing_tasks:
-                    typing_task = typing_tasks[unique_key]
-                    del typing_tasks[unique_key]
-                    if not typing_task.done():
-                        typing_task.cancel()
-                        try:
-                            await typing_task
-                        except asyncio.CancelledError:
-                            pass
-            else:
-                await update_status_message(chat_id, message_id, "🎥 Генерация видео...")
-#                await send_message(chat_id, message_id, "🎥 Генерация видео...", task_data)
-        except Exception as e:
-            logger.error(f"Video GET callback error: {str(e)}")
-            
-    async def post(self):
-        try:
-            data = json.loads(self.request.body)
-            task_id = data['task_id']
-            status = data['status']
-            # Получаем связанные данные из Redis
-            task_data = redis_client.get(f"video_task:{task_id}")
-            if not task_data:
-                return
-                
-            task_data = json.loads(task_data)
-            chat_id = task_data['chat_id']
-            message_id = task_data['message_id']
-            user_id = task_data['user_id']
-            
-#            chat_id = "603789567"
-#            message_id = "873"
-            
-            print ("WORK VIDEOCALLBACKHANDLER", data, chat_id, message_id)
-            if status == 'completed':
-                video_url = urljoin('https://192.168.1.50:6000/', data['download_url'])
-                await self.send_video_to_telegram(chat_id, message_id, video_url)
-                
-                # Удаляем временные данные
-                redis_client.delete(f"video_task:{task_id}")
-                unique_key = f"{chat_id}:{message_id}"
-                ## завершение отображение печати
-                if unique_key in typing_tasks:
-                    typing_task = typing_tasks[unique_key]
-                    del typing_tasks[unique_key]
-                    if not typing_task.done():
-                        typing_task.cancel()
-                        try:
-                            await typing_task
-                        except asyncio.CancelledError:
-                            pass
-                update_gen_counts(user_id)
-                await delete_status_message(chat_id, message_id)
-                await self.sender.send(compress({
-                    'chat_id': chat_id,
-                    'message_id': message_id,
-                    'type': 'video_gen_done'
-                }))
-
-        except Exception as e:
-            logger.error(f"Video callback error: {str(e)}")
-
-    async def download_video(self, video_url: str) -> None:
-        headers = {"X-API-Key": "default-api-key-change-me"}
+        # Настраиваем SSL-контекст для защищенного соединения
         ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
         ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
-        ssl_context.check_hostname = True
-        ssl_context.verify_mode = ssl.CERT_REQUIRED       
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=ssl_context)
-        ) as session:
-            async with session.get(video_url, headers=headers) as response:
-                response.raise_for_status()
-                return await response.read()
+        
+        # Формируем данные для отправки на сервер OCR
+        data = aiohttp.FormData()
+        # Добавляем изображение
+        data.add_field('image', open(image_path, 'rb'), filename=f'ocr_image_{user_id}_{file_id}.jpg')
+        
+        # Добавляем параметры для OCR (опционально)
+        ocr_params = {
+            'prompt': '<image>\n<|grounding|>Convert the document to markdown. ',
+            'save_results': False,
+            'test_compress': True
+        }
+        data.add_field('params', json.dumps(ocr_params))
+        
+#        # Создаем сессию с настроенным SSL-контекстом
+#        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
+#            # Отправляем POST-запрос на сервер OCR
+#            async with session.post(OCR_SERVER_URL, data=data) as resp:
+#                # Если запрос успешен (статус 200)
+#                if resp.status == 200:
+#                    # Получаем результат в формате JSON
+#                    result = await resp.json()
+#                    # Извлекаем распознанный текст
+#                    extracted_text = result.get('extracted_text', '')
+#                    return extracted_text
+#                else:
+#                    logger.error(f"OCR server responded with status: {resp.status}")
+#                    return None
                     
-    async def send_video_to_telegram(self, chat_id, message_id, video_url):
-        async with aiohttp.ClientSession() as session:
-            # Скачиваем видео с сервера генерации
-            video_data = await self.download_video(video_url)
+        # Создаем сессию с настроенным SSL-контекстом
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
+            # Отправляем POST-запрос на сервер генерации видео
+            async with session.post(OCR_SERVER_URL, data=data) as resp:
+                # Если запрос успешен (статус 200)
+                if resp.status == 200:
+                    # Получаем результат в формате JSON
+                    result = await resp.json()
+                    # Извлекаем ID задачи
+                    task_id = result.get('task_id')
+                    # Сохраняем связь задачи с чатом в Redis
+                    redis_client.setex(
+                        f"ocr_task:{task_id}",  # Ключ для хранения в Redis
+                        3600*100,  # Время жизни ключа - 100 часов
+                        json.dumps({  # Сохраняем данные в формате JSON
+                            'chat_id': chat_id,
+                            'message_id': message_id,
+                            'user_id': user_id
+                        })
+                    )
+                    # Возвращаем ID задачи
+                    return task_id
+                else:
+                    # Если статус не 200, логируем предупреждение и повторяем попытку
+                    logger.warning(f"Video server responded with status: {resp.status}, retrying in {retry_delay} seconds...")  
+  
+                    
+    except Exception as e:
+        logger.error(f"OCR task failed: {str(e)}")
+        return None
 
-            # Отправляем видео в Telegram
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-            data = aiohttp.FormData()
-            data.add_field('chat_id', str(chat_id))
-            data.add_field('reply_to_message_id', str(message_id))
-            data.add_field('video', video_data, 
-                         filename='video.mp4',
-                         content_type='video/mp4')
-            
-            async with session.post(url, data=data) as tg_resp:
-                if tg_resp.status != 200:
-                    logger.error(f"Failed to send video: {await tg_resp.text()}")
+#async def query_ocr_server(user_id, chat_id, message_id, file_id):
+#    # Запускаем таймер для отслеживания общего времени выполнения
+#    start_time = time.time()
+#    # Максимальное время ожидания - 10 минут
+#    timeout = 600  # 10 минут в секундах
+#    # Начальная задержка между повторными попытками
+#    retry_delay = 5  # Начинаем с 5 секунд между попытками
+#    # Максимальная задержка между повторными попытками
+#    max_retry_delay = 30  # Максимальная задержка между попытками
+#    
+#    # Выполняем попытки подключения, пока не истечет время ожидания
+#    while time.time() - start_time < timeout:
+#        try:
+#            
+#            # Получаем путь к изображению пользователя
+#            image_path = get_user_image_path(user_id, file_id)
+#            
+#            # URL для обратного вызова, куда сервер отправит результат после обработки
+#            callback_url = "https://192.168.1.50:8443/video_callback"  # Внешний URL для обратного вызова
+#            
+#            # Настраиваем SSL-контекст для защищенного соединения
+#            ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
+#            ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
+#            
+#            # Формируем данные для отправки на сервер
+#            data = aiohttp.FormData()
+#            # Добавляем аудиофайл
+#            data.add_field('audio', open(audio_path, 'rb'), filename='audio.wav')
+#            # Добавляем изображение
+#            data.add_field('image', open(image_path, 'rb'), filename=f'speaker_reference_{user_id}_{file_id}.jpg')
+#            # Добавляем параметры для генерации видео
+#            data.add_field('video_params', json.dumps({"pose_weight": 1.0}))
+#            # Добавляем URL для обратного вызова
+#            data.add_field('callback_url', callback_url)
+#            
+#            # Создаем сессию с настроенным SSL-контекстом
+#            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
+#                # Отправляем POST-запрос на сервер генерации видео
+#                async with session.post(OCR_SERVER_URL, data=data) as resp:
+#                    # Если запрос успешен (статус 200)
+#                    if resp.status == 200:
+#                        # Получаем результат в формате JSON
+#                        result = await resp.json()
+#                        # Извлекаем ID задачи
+#                        task_id = result.get('task_id')
+#                        # Сохраняем связь задачи с чатом в Redis
+#                        redis_client.setex(
+#                            f"ocr_task:{task_id}",  # Ключ для хранения в Redis
+#                            3600*100,  # Время жизни ключа - 100 часов
+#                            json.dumps({  # Сохраняем данные в формате JSON
+#                                'chat_id': chat_id,
+#                                'message_id': message_id,
+#                                'user_id': user_id
+#                            })
+#                        )
+#                        # Возвращаем ID задачи
+#                        return task_id
+#                    else:
+#                        # Если статус не 200, логируем предупреждение и повторяем попытку
+#                        logger.warning(f"Video server responded with status: {resp.status}, retrying in {retry_delay} seconds...")
+#                        
+#        except (aiohttp.ClientError, ConnectionError, TimeoutError) as e:
+#            # Обрабатываем ошибки соединения
+#            logger.warning(f"Connection error: {str(e)}, retrying in {retry_delay} seconds...")
+#        except Exception as e:
+#            # Обрабатываем другие ошибки
+#            logger.error(f"Video task creation failed: {str(e)}")
+#            # Для не связанных с подключением ошибок не повторяем попытки
+#            return None
+#            
+#        # Ожидаем перед повторной попыткой
+#        await asyncio.sleep(retry_delay)
+#        # Реализуем экспоненциальную задержку (увеличиваем время между повторными попытками)
+#        retry_delay = min(retry_delay * 1.5, max_retry_delay)
+#    
+#    # Если исчерпали все попытки повторного подключения
+#    logger.error(f"Failed to connect to video server after trying for {timeout} seconds")
+#    return None
+
+
+###################
+#### END OCR Server
+###################
 
 def get_user_image_path(user_id: int, file_id: str) -> str:
     """Возвращает путь к изображению пользователя с проверкой расширений"""
@@ -706,191 +474,6 @@ def get_user_image_path(user_id: int, file_id: str) -> str:
     
     # Если файл не найден, возвращаем дефолтное изображение
     return "/home/npu/agi/media/4.jpg"
-
-async def send_gen_image(chat_id: int, message_id: int, image_base64: str) -> bool:
-    """Отправка изображения в формате base64 через Telegram Bot API"""
-    try:
-        # Декодируем base64 в бинарные данные
-        image_data = base64.b64decode(image_base64)
-    except (base64.binascii.Error, TypeError) as e:
-        logging.error(f"Base64 decoding error: {str(e)}")
-        return False
-    
-    # Создаем форму данных
-    data = aiohttp.FormData()
-    data.add_field('chat_id', str(chat_id))
-    data.add_field('reply_to_message_id', str(message_id))
-    print (type(image_base64))
-    try:
-        # Добавляем изображение как файл в память
-        data.add_field(
-            name='photo',
-            value=image_data,
-            filename='generated_image.jpg',
-            content_type='image/jpeg'
-        )
-
-        # Отправляем запрос
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.post(url, data=data) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logging.error(f"Telegram API error: {error_text}")
-                    return False
-
-                # Обрабатываем успешный ответ
-                result = await response.json()
-                sent_message_id = result['result']['message_id']
-                await save_menu_state(chat_id, sent_message_id, 'main')
-                return True
-
-    except aiohttp.ClientError as e:
-        logging.error(f"Network error: {str(e)}")
-        return False
-    except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}")
-        return False
-
-async def query_synthesize_video_server(user_id, chat_id, message_id, file_id):
-    # Запускаем таймер для отслеживания общего времени выполнения
-    start_time = time.time()
-    # Максимальное время ожидания - 10 минут
-    timeout = 600  # 10 минут в секундах
-    # Начальная задержка между повторными попытками
-    retry_delay = 5  # Начинаем с 5 секунд между попытками
-    # Максимальная задержка между повторными попытками
-    max_retry_delay = 30  # Максимальная задержка между попытками
-    
-    # Выполняем попытки подключения, пока не истечет время ожидания
-    while time.time() - start_time < timeout:
-        try:
-            # Получаем текущий режим голоса из Redis
-            voice_mode = redis_client.get(f"voice_mode:{user_id}") or b"neural"
-            # Декодируем байтовую строку в обычную строку
-            voice_mode = voice_mode.decode()
-            # Выводим отладочную информацию о текущем режиме голоса
-            print("QUERY_SYNTHESIZE_VIDEO_SERVER!!!!!!!!!!!!------------", voice_mode)
-            
-            # Выбираем соответствующий аудиофайл в зависимости от режима голоса
-            if voice_mode == "user":
-                # Если используется голос пользователя, берем его образец
-                audio_path = f"data_users/speaker_reference_{user_id}.wav"
-            else:
-                # Иначе используем сгенерированный клонированный голос
-                audio_path = f"data_users/{user_id}_clon_out.wav"
-            
-            # Получаем путь к изображению пользователя
-            image_path = get_user_image_path(user_id, file_id)
-            
-            # URL для обратного вызова, куда сервер отправит результат после обработки
-            callback_url = "https://192.168.1.50:8443/video_callback"  # Внешний URL для обратного вызова
-            
-            # Настраиваем SSL-контекст для защищенного соединения
-            ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
-            ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
-            
-            # Формируем данные для отправки на сервер
-            data = aiohttp.FormData()
-            # Добавляем аудиофайл
-            data.add_field('audio', open(audio_path, 'rb'), filename='audio.wav')
-            # Добавляем изображение
-            data.add_field('image', open(image_path, 'rb'), filename=f'speaker_reference_{user_id}_{file_id}.jpg')
-            # Добавляем параметры для генерации видео
-            data.add_field('video_params', json.dumps({"pose_weight": 1.0}))
-            # Добавляем URL для обратного вызова
-            data.add_field('callback_url', callback_url)
-            
-            # Создаем сессию с настроенным SSL-контекстом
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-                # Отправляем POST-запрос на сервер генерации видео
-                async with session.post('https://192.168.1.50:6000/generate_video', data=data) as resp:
-                    # Если запрос успешен (статус 200)
-                    if resp.status == 200:
-                        # Получаем результат в формате JSON
-                        result = await resp.json()
-                        # Извлекаем ID задачи
-                        task_id = result.get('task_id')
-                        # Сохраняем связь задачи с чатом в Redis
-                        redis_client.setex(
-                            f"video_task:{task_id}",  # Ключ для хранения в Redis
-                            3600*100,  # Время жизни ключа - 100 часов
-                            json.dumps({  # Сохраняем данные в формате JSON
-                                'chat_id': chat_id,
-                                'message_id': message_id,
-                                'user_id': user_id
-                            })
-                        )
-                        # Возвращаем ID задачи
-                        return task_id
-                    else:
-                        # Если статус не 200, логируем предупреждение и повторяем попытку
-                        logger.warning(f"Video server responded with status: {resp.status}, retrying in {retry_delay} seconds...")
-                        
-        except (aiohttp.ClientError, ConnectionError, TimeoutError) as e:
-            # Обрабатываем ошибки соединения
-            logger.warning(f"Connection error: {str(e)}, retrying in {retry_delay} seconds...")
-        except Exception as e:
-            # Обрабатываем другие ошибки
-            logger.error(f"Video task creation failed: {str(e)}")
-            # Для не связанных с подключением ошибок не повторяем попытки
-            return None
-            
-        # Ожидаем перед повторной попыткой
-        await asyncio.sleep(retry_delay)
-        # Реализуем экспоненциальную задержку (увеличиваем время между повторными попытками)
-        retry_delay = min(retry_delay * 1.5, max_retry_delay)
-    
-    # Если исчерпали все попытки повторного подключения
-    logger.error(f"Failed to connect to video server after trying for {timeout} seconds")
-    return None
-
-#async def query_synthesize_video_server(user_id, chat_id, message_id, file_id):
-#    try:
-#        # Получаем текущий режим голоса
-#        voice_mode = redis_client.get(f"voice_mode:{user_id}") or b"neural"
-#        voice_mode = voice_mode.decode()
-#        print ("QUERY_SYNTHESIZE_VIDEO_SERVER!!!!!!!!!!!!------------", voice_mode)
-#        # Выбираем соответствующий аудиофайл
-#        if voice_mode == "user":
-#            audio_path = f"data_users/speaker_reference_{user_id}.wav"
-#        else:
-#            audio_path = f"data_users/{user_id}_clon_out.wav"
-#        
-#        #image_path = f"data_users/speaker_reference_{user_id}_{file_id}.jpg"  # Предполагаем наличие изображения
-#        image_path = get_user_image_path(user_id, file_id)
-#        
-#        callback_url = "https://192.168.1.50:8443/video_callback"  # Ваш внешний URL
-#        
-#        ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
-#        ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
-#        
-#        
-#        data = aiohttp.FormData()
-#        data.add_field('audio', open(audio_path, 'rb'), filename='audio.wav')
-#        data.add_field('image', open(image_path, 'rb'), filename=f'speaker_reference_{user_id}_{file_id}.jpg')
-#        data.add_field('video_params', json.dumps({"pose_weight": 1.0}))
-#        data.add_field('callback_url', callback_url)
-#        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-#            async with session.post('https://192.168.1.50:5000/generate_video', data=data) as resp:
-#                if resp.status == 200:
-#                    result = await resp.json()
-#                    task_id = result.get('task_id')
-#                    # Сохраняем связь задачи с чатом
-#                    redis_client.setex(
-#                        f"video_task:{task_id}",
-#                        3600*3,  # 1 час
-#                        json.dumps({
-#                            'chat_id': chat_id,
-#                            'message_id': message_id,
-#                            'user_id': user_id
-#                        })
-#                    )
-#                    return task_id
-#    except Exception as e:
-#        logger.error(f"Video task creation failed: {str(e)}")
-#    return None
-    
 
 async def pipeline_worker():
     from TTS.tts.configs.xtts_config import XttsConfig
@@ -931,10 +514,6 @@ async def pipeline_worker():
         xtts_model = Xtts.init_from_config(xtts_config)
         xtts_model.load_checkpoint(xtts_config, checkpoint_dir="./XTTS-v2/", eval=True)
         xtts_model.to("xpu:0")
-        # В конфигурации XTTS установите
-        #xtts_config.batch_size = 8  # Увеличить размер батча
-        #xtts_config.use_low_precision = True  # Использовать низкую точность
-        
         
         async def send_status_update(chat_id, message_id, status):
             await sender.send(compress({
@@ -944,7 +523,7 @@ async def pipeline_worker():
                 'type': 'status_update'
             }))
             
-        # Функция для обработки голосового ответа (вынесена для устранения дублирования)
+        # Функция для обработки голосового ответа
         async def process_voice_response(response_text, message_type, is_voice_input=False):
             nonlocal chat_id, message_id, message
             user_id = message['user_id']
@@ -959,7 +538,6 @@ async def pipeline_worker():
             remaining_daily = DAILY_WORD_LIMIT - daily
             remaining_monthly = MONTHLY_WORD_LIMIT - monthly
 
-                
             # Определяем максимально допустимое количество слов
             max_allowed = min(remaining_daily, remaining_monthly)            
             # Формируем текст для отображения
@@ -979,42 +557,6 @@ async def pipeline_worker():
                     'message_id': message_id,
                     'type': 'process_voice_response'
                 }))                  
-#                await send_status_update(chat_id, message_id, f"{display_text}\n\n 🔊 Синтез речи...")
-
-#                # Проверяем наличие доступных лимитов
-#                if remaining_daily <= 0 or remaining_monthly <= 0:
-#                    limit_msg = check_word_limits(user_id)
-#                    await send_status_update(chat_id, message_id, limit_msg)
-#                    await sender.send(compress({
-#                        'chat_id': chat_id,
-#                        'text': display_text,
-#                        'message_id': message_id,
-#                        'type': 'stop_typing_action'
-#                    }))
-#                    return
-#                word_count = count_words(response_text)
-#                
-#                # Обрезаем текст, если превышает лимит
-#                if word_count > max_allowed:
-#                    words = response_text.split()[:max_allowed]
-#                    response_text = ' '.join(words)
-#                    word_count = max_allowed
-
-#                # Обновляем счетчики
-#                update_word_counts(user_id, word_count)
-#                
-#                # Синтезируем речь
-#                output_path = synthesize_speech(response_text, xtts_model, xtts_config, user_id)
-#                with open(output_path, 'rb') as audio_file:
-#                    audio_content = audio_file.read()
-#                # Отправляем голосовое сообщение
-#                await sender.send(compress({
-#                    'chat_id': chat_id,
-#                    'audio': audio_content,
-#                    'text': display_text,
-#                    'message_id': message_id,
-#                    'type': 'voice'
-#                }))                               
             else:
                 await send_status_update(chat_id, message_id, f"🔊 Синтез речи...")
                 
@@ -1082,7 +624,6 @@ async def pipeline_worker():
                 elif message_type == 'status_update_video':
                     await send_status_update(chat_id, message_id, message["status"])
                     continue  # Переходим к следующей итерации цикла
-#                elif message_type == 'gen_voice':
                 elif message_type.startswith(('gen_voice')):
                     # Обрабатываем gen_voice отдельно - здесь уже есть текст для синтеза
                     text = message['text']
@@ -1092,7 +633,6 @@ async def pipeline_worker():
                     text = message['text'] 
                     await send_status_update(chat_id, message_id, "🖼️ Генерация изображения...")  
                     output_image = await query_image_server_simple(text, chat_id, message_id)
-                    ##print ("OUTPUT_IMAGe-------->", output_image)
                     await send_gen_image(chat_id, message_id, output_image['images'])
                     await sender.send(compress({
                         'chat_id': chat_id,
@@ -1100,6 +640,33 @@ async def pipeline_worker():
                         'type': 'stop_typing_action',
                         'text': text
                     }))
+                elif message_type == 'ocr':
+                    # Обработка OCR запроса
+                    file_id = message['file_id']
+                    #await send_status_update(chat_id, message_id, "📖 Распознавание текста...")
+                    extracted_text = await query_ocr_server(message['user_id'], chat_id, message_id, file_id)
+                    print ("бработка OCR запроса----->", extracted_text)
+                    if extracted_text:
+#                        await sender.send(compress({
+#                            'chat_id': chat_id,
+#                            'text': f"📖 Распознанный текст:\n\n{extracted_text}",
+#                            'message_id': message_id,
+#                            'type': 'text'
+#                        }))
+                        await sender.send(compress({
+                            'chat_id': chat_id,
+                            'text': f"📖 Распознавание текста...\n\nID задачи: {extracted_text}",
+                            'message_id': message_id,
+                            'type': 'text'
+                        }))
+                    else:
+                        await sender.send(compress({
+                            'chat_id': chat_id,
+                            'text': "❌ Не удалось распознать текст",
+                            'message_id': message_id,
+                            'type': 'text'
+                        }))
+                    continue
                 else:
                     logger.warning(f"Неизвестный тип сообщения: {message_type}")
                     continue
@@ -1109,7 +676,7 @@ async def pipeline_worker():
                     logger.info(f"PIPELINE_WORKER--------------2>{message_type}, {text}")
                 
                 # Генерация текстового ответа если нужно
-                if message_type not in ['status_update_video', 'gen_voice', 'gen_image'] and text is not None:
+                if message_type not in ['status_update_video', 'gen_voice', 'gen_image', 'ocr'] and text is not None:
                     # Генерация текста
                     cursor.execute('SELECT message, role FROM dialogs WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 5', (chat_id,))
                     history = cursor.fetchall()
@@ -1128,7 +695,6 @@ async def pipeline_worker():
                 if message_type == 'voice':
                     if response:
                         await process_voice_response(response, message_type, is_voice_input=True)
-#                elif message_type == 'gen_voice':
                 elif message_type.startswith(('gen_voice')):
                     if response:
                         await process_voice_response(response, message_type, is_voice_input=False)
@@ -1232,34 +798,20 @@ class MessageHandler(tornado.web.RequestHandler):
                     elif 'text' in message:
                         await self.handle_text_message(chat_id, user_id, message_id, message['text'])
                     elif 'photo' in message:
-                        if user_id == "naturalkind":
-                            DAILY_GEN_LIMIT = 2000
-                            telegram_photo = message['photo'][-1]
-                        else:
-                            DAILY_GEN_LIMIT = 2
-                            telegram_photo = message['photo'][-2]
-                        MONTHLY_GEN_LIMIT = DAILY_GEN_LIMIT*4
-                        # Получаем текущие счетчики пользователя
-                        daily, monthly = get_user_gen_counts(user_id)
-                        remaining_daily = DAILY_GEN_LIMIT - daily
-                        remaining_monthly = MONTHLY_GEN_LIMIT - monthly
-                        # Проверяем наличие доступных лимитов
-                        if remaining_daily <= 0 or remaining_monthly <= 0:
-                            limit_msg = check_gen_limits(user_id)                    
-                            await self.send_message_func(chat_id, message_id, limit_msg, menu_mod=False)
-                        else:
-                            await self.download_image(telegram_photo['file_id'], user_id)
-                            print ("ИЗОБРАЖЕНИЕ!!!!>", message['photo'], telegram_photo, telegram_photo['file_id'])
-#                            #await send_status_update(chat_id, message_id, "🎥 Генерация видео...")
-#                            await sender.send(compress({
-#                                'chat_id': chat_id,
-#                                'message_id': message_id,
-#                                'user_id':user_id, 
-#                                'status': "🎥 Генерация видео...",
-#                                'type': 'status_update_video'
-#                            }))
-#                            await self.start_typing_action(message_id, chat_id)
-#                            await query_synthesize_video_server(user_id, chat_id, message_id, telegram_photo['file_id'])                    
+                        # Обработка фото для OCR
+                        telegram_photo = message['photo'][-1]  # Берем самое качественное изображение
+                        await self.download_image(telegram_photo['file_id'], user_id)
+                        print ("ИЗОБРАЖЕНИЕ ДЛЯ OCR!!!!>", message['photo'], telegram_photo, telegram_photo['file_id'])
+                        
+                        # Отправляем задачу на OCR распознавание
+                        await self.start_typing_action(message_id, chat_id)
+                        await self.sender.send(compress({
+                            'chat_id': chat_id,
+                            'user_id': user_id,
+                            'file_id': telegram_photo['file_id'],
+                            'message_id': message_id,
+                            'type': 'ocr'
+                        }))
                     else:
                         await self.send_message_func(chat_id, message_id, "Пожалуйста, перешлите текстовое или голосовое сообщение")
                     return
@@ -1271,38 +823,20 @@ class MessageHandler(tornado.web.RequestHandler):
                 elif 'document' in message:
                     await self.handle_document_message(chat_id, user_id, message_id, message['document'])
                 elif 'photo' in message:
-                    if user_id == "naturalkind":
-                        DAILY_GEN_LIMIT = 2000
-                        telegram_photo = message['photo'][-1]
-                    else:
-                        DAILY_GEN_LIMIT = 2
-                        telegram_photo = message['photo'][-2]
-                    MONTHLY_GEN_LIMIT = DAILY_GEN_LIMIT*4                        
-                    # Получаем текущие счетчики пользователя
-                    daily, monthly = get_user_gen_counts(user_id)
-                    remaining_daily = DAILY_GEN_LIMIT - daily
-                    remaining_monthly = MONTHLY_GEN_LIMIT - monthly
-                    # Проверяем наличие доступных лимитов
-                    if remaining_daily <= 0 or remaining_monthly <= 0:
-                        limit_msg = check_gen_limits(user_id)                    
-                        await self.send_message_func(chat_id, message_id, limit_msg, menu_mod=False)
-                    else:
-                        await self.download_image(telegram_photo['file_id'], user_id)
-                        print ("ИЗОБРАЖЕНИЕ!!!!", message['photo'], telegram_photo, telegram_photo['file_id'])
-                        
-                        
-                        
-                        #await send_status_update(chat_id, message_id, "🎥 Генерация видео...")
-                        
-#                        await sender.send(compress({
-#                            'chat_id': chat_id,
-#                            'message_id': message_id,
-#                            'user_id':user_id, 
-#                            'status': "🎥 Генерация видео...",
-#                            'type': 'status_update_video'
-#                        }))
-#                        await self.start_typing_action(message_id, chat_id)
-#                        await query_synthesize_video_server(user_id, chat_id, message_id, telegram_photo['file_id'])
+                    # Обработка фото для OCR
+                    telegram_photo = message['photo'][-1]  # Берем самое качественное изображение
+                    await self.download_image(telegram_photo['file_id'], user_id)
+                    print ("ИЗОБРАЖЕНИЕ ДЛЯ OCR!!!!", message['photo'], telegram_photo, telegram_photo['file_id'])
+                    
+                    # Отправляем задачу на OCR распознавание
+                    await self.start_typing_action(message_id, chat_id)
+                    await self.sender.send(compress({
+                        'chat_id': chat_id,
+                        'user_id': user_id,
+                        'file_id': telegram_photo['file_id'],
+                        'message_id': message_id,
+                        'type': 'ocr'
+                    }))
 
                 elif 'audio' in message:
                     await self.handle_audio_message(chat_id, user_id, message_id, message['audio']['file_id'])
@@ -1333,7 +867,6 @@ class MessageHandler(tornado.web.RequestHandler):
                     await self.send_gen_video_menu(chat_id, message_id)
                 elif data == 'menu_close':
                     await menu_close(chat_id, message_id)
-#                elif data == 'settings':
                 elif data.lower().startswith(('settings')):
                     print ("SETTTTT->>>>>")
                     # использльзавать голос пользователя
@@ -1346,7 +879,6 @@ class MessageHandler(tornado.web.RequestHandler):
                             await self.handle_voice_selection(user_id, chat_id, message_id, "neural")                
                     else:        
                         await self.send_settings_menu(chat_id, message_id, user_id)
-#                elif data == 'gen_voice':
                 elif data.startswith(('gen_voice')):
                     await self.start_typing_action(message_id, chat_id)
                     parts = data.split('_')[-1]
@@ -1355,7 +887,6 @@ class MessageHandler(tornado.web.RequestHandler):
                     elif int(parts) == 1:
                         text = callback_query.get('message', {}).get('text', {})
                     # Отправить
-                    #await self.gen_voice_selection(text, chat_id, message_id, user_id)
                     await sender.send(compress({
                         'chat_id': chat_id,
                         'user_id': user_id,
@@ -1371,8 +902,7 @@ class MessageHandler(tornado.web.RequestHandler):
                     elif int(parts) == 1:
                         text = callback_query.get('message', {}).get('text', {})                   
                     
-                    # Отправить на сервер генерации LCM_Dreamshaper_v7-int8-ov
-                    
+                    # Отправить на сервер генерации изображений
                     await sender.send(compress({
                         'chat_id': chat_id,
                         'user_id': user_id,
@@ -1380,18 +910,6 @@ class MessageHandler(tornado.web.RequestHandler):
                         'message_id': message_id,
                         'type': 'gen_image'
                     }))                    
-                    
-                    
-#                elif data == 'select_image':
-#                    await self.send_image_selection(chat_id, message_id)
-#                elif data.startswith('voice_'):
-#                    voice_type = data.split('_')[1]
-#                    await self.handle_voice_selection(chat_id, message_id, voice_type)
-#                elif data.startswith('image_'):
-#                    image_type = data.split('_')[1]
-#                    await self.handle_image_selection(chat_id, message_id, image_type)                    
-                    
-                    
                     
                 ## Обязательно отправляем ответ на callback-запрос
                 url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
@@ -1404,63 +922,6 @@ class MessageHandler(tornado.web.RequestHandler):
             logger.error(f"Error processing message: {e}")
             await self.stop_typing_action(unique_key)
     
-#    async def gen_voice_selection(self, response, chat_id, message_id, user_id):
-#        # Получаем текущие счетчики пользователя
-#        daily, monthly = get_user_word_counts(user_id)
-#        remaining_daily = DAILY_WORD_LIMIT - daily
-#        remaining_monthly = MONTHLY_WORD_LIMIT - monthly
-#        print ("----------->", daily, monthly, remaining_daily, remaining_monthly)
-#        # Проверяем наличие доступных лимитов
-#        if remaining_daily <= 0 or remaining_monthly <= 0:
-#            limit_msg = check_word_limits(user_id)
-#            await send_status_update(chat_id, message_id, limit_msg)
-#            await sender.send(compress({
-#                'chat_id': chat_id,
-#                'text': response,
-#                'message_id': message_id,
-#                'type': 'stop_typing_action'
-#            }))
-#        else:
-#            # Определяем максимально допустимое количество слов
-#            max_allowed = min(remaining_daily, remaining_monthly)
-#            word_count = count_words(response)
-#            # Обрезаем текст, если превышает лимит
-#            if word_count > max_allowed:
-#                
-#                words = response.split()[:max_allowed]
-#                response = ' '.join(words)
-#                word_count = max_allowed
-
-#            # Обновляем счетчики
-#            update_word_counts(user_id, word_count)
-#            # Остальная логика обработки...
-#            
-#            output_path = synthesize_speech(response, xtts_model, xtts_config, user_id)
-#            #------------------------
-#            #подключаюсь к серверу
-##                    await send_status_update(chat_id, message_id, "🎥 Генерация видео...")
-##                    video_task_id = await query_synthesize_video_server(user_id, chat_id, message_id)
-#                                                                
-#            
-#            # Сохраняем временный ответ
-#            #response += "\n\n🎬 Видео обрабатывается..."                    
-#            
-#            #------------------------
-#            #response = f"*Перевод:* `{text}`\n *Ответ:* `{response}`"
-#            with open(output_path, 'rb') as audio_file:
-#                audio_content = audio_file.read()
-#            
-#            await sender.send(compress({
-#                'chat_id': chat_id,
-#                'audio': audio_content,
-#                'text': response,
-#                'message_id': message_id,
-#                'type': 'voice'
-#            }))
-        
-        
-        
-    
     async def send_gen_video_menu(self, chat_id, message_id):
         """
         Написать здесь функцию
@@ -1472,11 +933,8 @@ class MessageHandler(tornado.web.RequestHandler):
         await edit_buttons(chat_id, message_id, buttons)
         print ("-------------------->SEND_GEN_VIDEO_MENU")
 
-
     async def send_settings_menu(self, chat_id, user_id, message_id):
         await self.handle_text_message(chat_id, user_id, message_id, "/stats")
-
-
 
     async def send_voice_selection(self, chat_id, message_id):
         voices = {
@@ -1552,7 +1010,6 @@ class MessageHandler(tornado.web.RequestHandler):
         except Exception as e:
             logger.error(f"Image download error: {str(e)}")
             return None            
-#------------------
 
     async def handle_reset_command(self, command_type, chat_id, message_id, text, user_id):
         """Handle various reset commands with permission check and validation"""
@@ -1580,14 +1037,6 @@ class MessageHandler(tornado.web.RequestHandler):
         redis_client.set(f"voice_mode:{user_id}", voice_type)
         await self.send_message_func(chat_id, message_id, f"✅ Выбран режим генерации голоса: {voice_type}", menu_mod=False)
         
-#    async def handle_voice_selection(self, chat_id, message_id, voice_type):
-#        if voice_type == "custom":
-#            await self.send_message_func(chat_id, message_id, "Отправьте аудиофайл с образцом голоса (формат WAV)")
-#            redis_client.set(f"voice_mode:{chat_id}", "custom")
-#        else:
-#            redis_client.set(f"voice_mode:{chat_id}", voice_type)
-#            await self.send_message_func(chat_id, message_id, f"Выбран голос: {voice_type}")
-
     async def handle_text_message(self, chat_id, user_id, message_id, text):
         logger.info(f"Received message from user {user_id} in chat {chat_id}: {text[:50]}...")
 
@@ -1642,93 +1091,6 @@ class MessageHandler(tornado.web.RequestHandler):
                     'type': 'text'
                 }))
 
-#    async def send_start_menu(self, chat_id, message_id):
-#        ## Path to your local image file
-#        image_path = 'robots-AI.jpg'  ## Replace with your actual image path
-#        
-#        try:
-#            ## Read the entire file content first
-#            with open(image_path, 'rb') as image_file:
-#                image_data = image_file.read()
-#            
-#            ## Create form data for the request
-#            data = aiohttp.FormData()
-#            data.add_field('chat_id', str(chat_id))
-#            data.add_field('photo', image_data, filename='logo.jpg', 
-#                          content_type='image/jpeg')
-##            data.add_field('caption', "Привет! Я AI-ассистент")
-#            data.add_field('reply_to_message_id', str(message_id))
-#            data.add_field('reply_markup', json.dumps({
-##                "inline_keyboard": [
-##                    [
-##                        {"text": "🤖 О боте", "callback_data": "about"},
-##                        {"text": "💬 Возможности", "callback_data": "features"}
-##                    ],
-##                    [
-##                        {"text": "🔧 Сбросить диалог", "callback_data": "reset"},
-##                        {"text": "❓ Справка", "callback_data": "help"}
-##                    ]
-##                ]
-#                "inline_keyboard": [
-#                    [
-#                        {"text": "🤖 О боте", "callback_data": "about"},
-#                        {"text": "📘 Инструкция", "callback_data": "help"}
-#                    ],
-#                    [
-#                        {"text": "📹 Создать видео", "callback_data": "features"}
-#                    ],
-#                ]
-#            }))
-#            
-#            ## Send request to Telegram API
-#            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-#            async with aiohttp.ClientSession() as session:
-#                async with session.post(url, data=data) as response:
-#                    if response.status != 200:
-#                        error_text = await response.text()
-#                        logger.error(f"Error sending image: {error_text}")
-#                    return await response.json()
-#                    
-#        except FileNotFoundError:
-#            logger.error(f"Error: Image file not found at {image_path}")
-#            return None
-#        except Exception as e:
-#            logger.error(f"Error occurred: {str(e)}")
-#            return None
-
-    async def send_switch_voice(self, chat_id):
-        await delete_previous_menu(chat_id)
-        
-        try:
-
-            data = aiohttp.FormData()
-            data.add_field('chat_id', str(chat_id))
-            data.add_field('reply_markup', json.dumps({
-                "inline_keyboard": [
-                    [
-                        {"text": "🤖 О боте", "callback_data": "about"},
-                        {"text": "📘 Инструкция", "callback_data": "help"}
-                    ],
-                    [
-                        {"text": "📹 Настройки", "callback_data": "settings"}
-                    ]
-                ]
-            }))
-
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, data=data) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        message_id = result['result']['message_id']
-                        await save_menu_state(chat_id, message_id, 'main')
-                        return True
-        except Exception as e:
-            logger.error(f"Error sending start menu: {e}")
-        return False
-
-
-
     async def send_start_menu(self, chat_id):
         await delete_previous_menu(chat_id)
         
@@ -1763,8 +1125,6 @@ class MessageHandler(tornado.web.RequestHandler):
         except Exception as e:
             logger.error(f"Error sending start menu: {e}")
         return False
-
-
 
     async def handle_voice_message(self, chat_id, user_id, message_id, file_id):
         await self.start_typing_action(message_id, chat_id)
@@ -1893,7 +1253,6 @@ class MessageHandler(tornado.web.RequestHandler):
                     logger.error(f"Failed to get file path. Status code: {response.status}")
                     return None
 
-
     async def send_about_message(self, chat_id):
         await delete_previous_menu(chat_id)
         
@@ -1907,7 +1266,7 @@ class MessageHandler(tornado.web.RequestHandler):
         Статья в https://habr.com/ru/articles/881944/
 
         *Возможности*:
-        - Анимация лица любым голосом            
+        - Распознавание текста с изображений (OCR)           
         - Помощь в написании кода
         - Распознавание голосовых сообщений          
         - Общение
@@ -1918,7 +1277,7 @@ class MessageHandler(tornado.web.RequestHandler):
         - Phi-3.5-mini языковая модель чат бот
         - Whisper распознавание речи
         - XTTS v2 синтез голоса
-        - Hallo генерация видео
+        - DeepSeek-OCR распознавание текста
         """
         
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -1944,7 +1303,6 @@ class MessageHandler(tornado.web.RequestHandler):
         reset_response = reset_dialog(chat_id)
         await self.send_menu_message(chat_id, message_id, reset_response)
 
-
     async def send_help_message(self, chat_id, user_id):
         await delete_previous_menu(chat_id)
         
@@ -1956,8 +1314,8 @@ class MessageHandler(tornado.web.RequestHandler):
 
         - Отправьте текстовое сообщение для общения
         - Отправьте голосовое сообщение, бот ответит голосом спросившего
+        - Отправьте изображение с текстом для распознавания (OCR)
         - Поддерживается работа с текстовыми файлами (.txt, .py, .h, .cpp)
-        - Бот может анимировать изображение с лицом
 
         *Команды*:
         - /start - Перезапуск бота
@@ -1968,7 +1326,6 @@ class MessageHandler(tornado.web.RequestHandler):
 
         *✅ Выбран голоса для генерации видео*: `{voice_mode}`
         """
-        #- /settings neural или user - Выбор голоса для генерации видео
         
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         data = {
@@ -1992,7 +1349,6 @@ class MessageHandler(tornado.web.RequestHandler):
                     return True
         return False
 
-
     async def send_menu_message(self, chat_id, message_id, text, inline_keyboard = [[{"text": "📘 Инструкция", "callback_data": "help"}]]):
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         data = {
@@ -2006,7 +1362,9 @@ class MessageHandler(tornado.web.RequestHandler):
         }
         async with aiohttp.ClientSession() as session:
             await session.post(url, json=data)
-            
+
+# Остальные функции (send_message, send_voice, edit_buttons, menu_close, edit_message, delete_message, 
+# send_status_message, update_status_message, delete_status_message, process_responses) остаются без изменений
 # Альтернативная версия с использованием str.translate (более эффективная)
 # Временные маркеры для сохранения разметки
 import re
@@ -2075,7 +1433,6 @@ def escape_markdown_v2(text: str) -> str:
 #        escaped_text = escaped_text.replace(f"{temp_mention_marker}{i}{temp_mention_marker}", original_mention)
     
     return escaped_text
-
 
 async def send_message(chat_id, message_id, text, typing_tasks, menu_mod):
     print ("MENU_MOD =====>", menu_mod)
@@ -2394,6 +1751,136 @@ async def process_responses(receiver, send_message_func):
         
         await asyncio.sleep(0.1)
 
+class UnifiedCallbackHandler:
+    """Универсальный обработчик callback-ов для всех сервисов"""
+    
+    def __init__(self, sender):
+        self.sender = sender
+        self.callback_handlers = {
+            'video': self._handle_video_callback,
+            'ocr': self._handle_ocr_callback
+        }
+    
+    async def handle_callback(self, callback_type: str, data: dict):
+        """Основной метод обработки callback-ов"""
+        handler = self.callback_handlers.get(callback_type)
+        if handler:
+            await handler(data)
+        else:
+            logger.warning(f"Unknown callback type: {callback_type}")
+    
+    async def _handle_video_callback(self, data: dict):
+        """Обработчик видео callback-ов"""
+        try:
+            task_id = data['task_id']
+            status = data['status']
+            
+            task_data = redis_client.get(f"video_task:{task_id}")
+            if not task_data:
+                return
+                
+            task_data = json.loads(task_data)
+            chat_id = task_data['chat_id']
+            message_id = task_data['message_id']
+            user_id = task_data['user_id']
+            
+            if status == 'completed':
+                video_url = urljoin('https://192.168.1.50:6000/', data['download_url'])
+                await self._send_video_to_telegram(chat_id, message_id, video_url)
+                await self._cleanup_task(task_id, chat_id, message_id, user_id)
+                update_gen_counts(user_id)
+            else:
+                await update_status_message(chat_id, message_id, "Ошибка генерации видео")
+                await self._cleanup_task(task_id, chat_id, message_id, user_id)
+                
+        except Exception as e:
+            logger.error(f"Video callback error: {str(e)}")
+
+    async def _send_ocr_result(self, chat_id, message_id, extracted_text):
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        inline_keyboard = [[{"text": "📘 Инструкция", "callback_data": "help"}]]
+        data = {
+            "chat_id": chat_id,
+            "text": extracted_text,
+            "parse_mode": "Markdown",
+            "reply_to_message_id": message_id,
+            "reply_markup": json.dumps({
+                "inline_keyboard": inline_keyboard
+            })
+        }
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, json=data)    
+    async def _handle_ocr_callback(self, data: dict):
+        """Обработчик OCR callback-ов"""
+        print ("!!!!!!!!!!!!!!!!!!!!!!Обработчик OCR callback-ов")
+        try:
+            task_id = data['task_id']
+            status = data['status']
+            
+            task_data = redis_client.get(f"ocr_task:{task_id}")
+            print ("!!!!!!!!!!!!!!!!!!!!!!Обработчик OCR callback-ов", status, task_data)
+            if not task_data:
+                return
+                
+            task_data = json.loads(task_data)
+            chat_id = task_data['chat_id']
+            message_id = task_data['message_id']
+            user_id = task_data['user_id']
+            
+            if status == 'completed':
+                extracted_text = data.get('extracted_text', '')
+                print ("!------------!", task_data, extracted_text) 
+                await self._send_ocr_result(chat_id, message_id, extracted_text)
+                await self._cleanup_task(task_id, chat_id, message_id, user_id, task_type='ocr')
+            else:
+                await update_status_message(chat_id, message_id, "Ошибка распознавания текста")
+                await self._cleanup_task(task_id, chat_id, message_id, user_id, task_type='ocr')
+               
+        except Exception as e:
+            logger.error(f"OCR callback error: {str(e)}")
+    
+    async def _cleanup_task(self, task_id: str, chat_id: str, message_id: str, user_id: str, task_type: str = 'video'):
+        """Универсальная очистка задач"""
+        redis_key = f"{task_type}_task:{task_id}"
+        redis_client.delete(redis_key)
+        
+        unique_key = f"{chat_id}:{message_id}"
+        if unique_key in typing_tasks:
+            typing_task = typing_tasks[unique_key]
+            del typing_tasks[unique_key]
+            if not typing_task.done():
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
+        
+        await delete_status_message(chat_id, message_id)
+
+
+        
+class UniversalCallbackHandler(tornado.web.RequestHandler):
+    def initialize(self, callback_handler):
+        self.callback_handler = callback_handler
+    
+    async def post(self):
+        try:
+            data = json.loads(self.request.body)
+            callback_type = data.get('type', 'video')  # По умолчанию video для обратной совместимости
+            
+            print ("----------->", callback_type, data)
+            
+            await self.callback_handler.handle_callback(callback_type, data)
+            self.set_status(200)
+            self.write({"status": "ok"})
+            
+        except Exception as e:
+            logger.error(f"Universal callback error: {str(e)}")
+            self.set_status(500)
+            self.write({"error": str(e)})
+
+
+
 if __name__ == '__main__':
     mp.set_start_method('spawn')
     # Запуск сервера
@@ -2408,13 +1895,16 @@ if __name__ == '__main__':
     
     typing_tasks = {}
     
+    # Создание универсального обработчика
+    callback_handler = UnifiedCallbackHandler(sender)
+    
     application = tornado.web.Application([
         (r'/', MessageHandler, dict(
             sender=sender, 
             send_message_func=lambda chat_id, message_id, text, menu_mod=True: send_message(chat_id, message_id, text, typing_tasks, menu_mod=menu_mod),
             typing_tasks=typing_tasks
         )),
-        (r'/video_callback', VideoCallbackHandler, dict(sender=sender)),
+        (r'/callback', UniversalCallbackHandler, dict(callback_handler=callback_handler)),  # Универсальный endpoint
     ])
     
     http_server = tornado.httpserver.HTTPServer(
@@ -2429,7 +1919,6 @@ if __name__ == '__main__':
     http_server.listen(8443)
     logger.info("Server started on port 8443")
     
-#    tornado.ioloop.IOLoop.current().start()
     io_loop = tornado.ioloop.IOLoop.current()
     io_loop.add_callback(process_responses, receiver, lambda chat_id, message_id, text, menu_mod=True: send_message(chat_id, message_id, text, typing_tasks, menu_mod=menu_mod))
     io_loop.start()
