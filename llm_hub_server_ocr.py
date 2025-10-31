@@ -267,7 +267,7 @@ def synthesize_speech(text, model, config, user_id):
     return wav_path
 
 # INTEL VERSION PHI
-async def llm_server(messages, generation_args={"max_new_tokens":400, "temperature":0.7}):
+async def llm_server(messages, generation_args={"max_new_tokens":1000, "temperature":0.7}):
     # Создаем SSL контекст аналогично примеру download_video
     ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
     ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
@@ -279,7 +279,7 @@ async def llm_server(messages, generation_args={"max_new_tokens":400, "temperatu
     
     request_data = {
         "messages": messages,
-        "max_new_tokens": generation_args.get("max_new_tokens", 400),
+        "max_new_tokens": generation_args.get("max_new_tokens", 500),
         "temperature": generation_args.get("temperature", 0.7)
     }
     
@@ -377,86 +377,6 @@ async def query_ocr_server(user_id, chat_id, message_id, file_id):
     except Exception as e:
         logger.error(f"OCR task failed: {str(e)}")
         return None
-
-#async def query_ocr_server(user_id, chat_id, message_id, file_id):
-#    # Запускаем таймер для отслеживания общего времени выполнения
-#    start_time = time.time()
-#    # Максимальное время ожидания - 10 минут
-#    timeout = 600  # 10 минут в секундах
-#    # Начальная задержка между повторными попытками
-#    retry_delay = 5  # Начинаем с 5 секунд между попытками
-#    # Максимальная задержка между повторными попытками
-#    max_retry_delay = 30  # Максимальная задержка между попытками
-#    
-#    # Выполняем попытки подключения, пока не истечет время ожидания
-#    while time.time() - start_time < timeout:
-#        try:
-#            
-#            # Получаем путь к изображению пользователя
-#            image_path = get_user_image_path(user_id, file_id)
-#            
-#            # URL для обратного вызова, куда сервер отправит результат после обработки
-#            callback_url = "https://192.168.1.50:8443/video_callback"  # Внешний URL для обратного вызова
-#            
-#            # Настраиваем SSL-контекст для защищенного соединения
-#            ssl_context = ssl.create_default_context(cafile='ssl/ca.crt')
-#            ssl_context.load_cert_chain('ssl/client.crt', 'ssl/client.key')
-#            
-#            # Формируем данные для отправки на сервер
-#            data = aiohttp.FormData()
-#            # Добавляем аудиофайл
-#            data.add_field('audio', open(audio_path, 'rb'), filename='audio.wav')
-#            # Добавляем изображение
-#            data.add_field('image', open(image_path, 'rb'), filename=f'speaker_reference_{user_id}_{file_id}.jpg')
-#            # Добавляем параметры для генерации видео
-#            data.add_field('video_params', json.dumps({"pose_weight": 1.0}))
-#            # Добавляем URL для обратного вызова
-#            data.add_field('callback_url', callback_url)
-#            
-#            # Создаем сессию с настроенным SSL-контекстом
-#            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-#                # Отправляем POST-запрос на сервер генерации видео
-#                async with session.post(OCR_SERVER_URL, data=data) as resp:
-#                    # Если запрос успешен (статус 200)
-#                    if resp.status == 200:
-#                        # Получаем результат в формате JSON
-#                        result = await resp.json()
-#                        # Извлекаем ID задачи
-#                        task_id = result.get('task_id')
-#                        # Сохраняем связь задачи с чатом в Redis
-#                        redis_client.setex(
-#                            f"ocr_task:{task_id}",  # Ключ для хранения в Redis
-#                            3600*100,  # Время жизни ключа - 100 часов
-#                            json.dumps({  # Сохраняем данные в формате JSON
-#                                'chat_id': chat_id,
-#                                'message_id': message_id,
-#                                'user_id': user_id
-#                            })
-#                        )
-#                        # Возвращаем ID задачи
-#                        return task_id
-#                    else:
-#                        # Если статус не 200, логируем предупреждение и повторяем попытку
-#                        logger.warning(f"Video server responded with status: {resp.status}, retrying in {retry_delay} seconds...")
-#                        
-#        except (aiohttp.ClientError, ConnectionError, TimeoutError) as e:
-#            # Обрабатываем ошибки соединения
-#            logger.warning(f"Connection error: {str(e)}, retrying in {retry_delay} seconds...")
-#        except Exception as e:
-#            # Обрабатываем другие ошибки
-#            logger.error(f"Video task creation failed: {str(e)}")
-#            # Для не связанных с подключением ошибок не повторяем попытки
-#            return None
-#            
-#        # Ожидаем перед повторной попыткой
-#        await asyncio.sleep(retry_delay)
-#        # Реализуем экспоненциальную задержку (увеличиваем время между повторными попытками)
-#        retry_delay = min(retry_delay * 1.5, max_retry_delay)
-#    
-#    # Если исчерпали все попытки повторного подключения
-#    logger.error(f"Failed to connect to video server after trying for {timeout} seconds")
-#    return None
-
 
 ###################
 #### END OCR Server
@@ -653,12 +573,13 @@ async def pipeline_worker():
 #                            'message_id': message_id,
 #                            'type': 'text'
 #                        }))
-                        await sender.send(compress({
-                            'chat_id': chat_id,
-                            'text': f"📖 Распознавание текста...\n\nID задачи: {extracted_text}",
-                            'message_id': message_id,
-                            'type': 'text'
-                        }))
+#                        await sender.send(compress({
+#                            'chat_id': chat_id,
+#                            'text': f"📖 Распознавание текста...\n\nID задачи: {extracted_text}",
+#                            'message_id': message_id,
+#                            'type': 'text'
+#                        }))
+                        await send_status_update(chat_id, message_id, "📖 Распознавание текста...")
                     else:
                         await sender.send(compress({
                             'chat_id': chat_id,
@@ -1830,6 +1751,9 @@ class UnifiedCallbackHandler:
             if status == 'completed':
                 extracted_text = data.get('extracted_text', '')
                 print ("!------------!", task_data, extracted_text) 
+                # СОХРАНЕНИЕ В БАЗУ ДАННЫХ - ДОБАВЛЕНО
+                save_message_to_db(chat_id, extracted_text, "assistant")
+                
                 await self._send_ocr_result(chat_id, message_id, extracted_text)
                 await self._cleanup_task(task_id, chat_id, message_id, user_id, task_type='ocr')
             else:
