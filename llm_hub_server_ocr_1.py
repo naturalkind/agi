@@ -46,11 +46,9 @@ CLIENT_SEND_PORT = 5555  # Сервер отправляет результат�
 work_publisher = None
 context = None
 
-
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 
 # Инициализация устройства
 device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
@@ -67,16 +65,11 @@ with open('config.bot', 'r') as json_file:
 if not os.path.exists('data_users'):
     os.makedirs('data_users')
 
-#BOT_TOKEN = data['NATURAL_AI_BOT_TOKEN']
-BOT_TOKEN = data['SEARCH_INTELLIGENCE_BOT_TOKEN']
 # Токены для двух ботов
-#BOT_TOKEN = {
-#    'search_intelligence_bot': data['SEARCH_INTELLIGENCE_BOT_TOKEN'],
-#    'natural_ai_bot': data['NATURAL_AI_BOT_TOKEN']
-#}
-
-
-
+BOT_TOKENS = {
+    'search_intelligence_bot': data['SEARCH_INTELLIGENCE_BOT_TOKEN'],
+    'natural_ai_bot': data['NATURAL_AI_BOT_TOKEN']
+}
 
 REDIS_HOST = 'localhost'
 REDIS_PORT = 6379
@@ -342,24 +335,9 @@ async def query_ocr_server(user_id, chat_id, message_id, file_id):
         }
         data.add_field('params', json.dumps(ocr_params))
         
-#        # Создаем сессию с настроенным SSL-контекстом
-#        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-#            # Отправляем POST-запрос на сервер OCR
-#            async with session.post(OCR_SERVER_URL, data=data) as resp:
-#                # Если запрос успешен (статус 200)
-#                if resp.status == 200:
-#                    # Получаем результат в формате JSON
-#                    result = await resp.json()
-#                    # Извлекаем распознанный текст
-#                    extracted_text = result.get('extracted_text', '')
-#                    return extracted_text
-#                else:
-#                    logger.error(f"OCR server responded with status: {resp.status}")
-#                    return None
-                    
         # Создаем сессию с настроенным SSL-контекстом
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-            # Отправляем POST-запрос на сервер генерации видео
+            # Отправляем POST-запрос на сервер OCR
             async with session.post(OCR_SERVER_URL, data=data) as resp:
                 # Если запрос успешен (статус 200)
                 if resp.status == 200:
@@ -381,8 +359,7 @@ async def query_ocr_server(user_id, chat_id, message_id, file_id):
                     return task_id
                 else:
                     # Если статус не 200, логируем предупреждение и повторяем попытку
-                    logger.warning(f"Video server responded with status: {resp.status}, retrying in {retry_delay} seconds...")  
-  
+                    logger.warning(f"Video server responded with status: {resp.status}, retrying...")  
                     
     except Exception as e:
         logger.error(f"OCR task failed: {str(e)}")
@@ -445,8 +422,9 @@ async def pipeline_worker():
         xtts_model.load_checkpoint(xtts_config, checkpoint_dir="./XTTS-v2/", eval=True)
         xtts_model.to("xpu:0")
         
-        async def send_status_update(chat_id, message_id, status):
+        async def send_status_update(bot_type, chat_id, message_id, status):
             await sender.send(compress({
+                'bot_type': bot_type,
                 'chat_id': chat_id,
                 'message_id': message_id,
                 'status': status,
@@ -454,7 +432,7 @@ async def pipeline_worker():
             }))
             
         # Функция для обработки голосового ответа
-        async def process_voice_response(response_text, message_type, is_voice_input=False):
+        async def process_voice_response(bot_type, response_text, message_type, is_voice_input=False):
             nonlocal chat_id, message_id, message
             user_id = message['user_id']
             print ("PROCESS_VOICE_RESPONSE", user_id)
@@ -475,6 +453,7 @@ async def pipeline_worker():
                 display_text = f"""*Стенограмма голоса:* 
                                ```{text}```"""
                 await sender.send(compress({
+                    'bot_type': bot_type,
                     'chat_id': chat_id,
                     'text': display_text,
                     'message_id': message_id,
@@ -482,19 +461,21 @@ async def pipeline_worker():
                 }))  
                 display_text = f"""{response_text}"""
                 await sender.send(compress({
+                    'bot_type': bot_type,
                     'chat_id': chat_id,
                     'text': display_text,
                     'message_id': message_id,
                     'type': 'process_voice_response'
                 }))                  
             else:
-                await send_status_update(chat_id, message_id, f"🔊 Синтез речи...")
+                await send_status_update(bot_type, chat_id, message_id, f"🔊 Синтез речи...")
                 
                 # Проверяем наличие доступных лимитов
                 if remaining_daily <= 0 or remaining_monthly <= 0:
                     limit_msg = check_word_limits(user_id)
-                    await send_status_update(chat_id, message_id, limit_msg)
+                    await send_status_update(bot_type, chat_id, message_id, limit_msg)
                     await sender.send(compress({
+                        'bot_type': bot_type,
                         'chat_id': chat_id,
                         'message_id': message_id,
                         'type': 'stop_typing_action_'
@@ -516,6 +497,7 @@ async def pipeline_worker():
                     audio_content = audio_file.read()
                 # Отправляем голосовое сообщение
                 await sender.send(compress({
+                    'bot_type': bot_type,
                     'chat_id': chat_id,
                     'audio': audio_content,
                     'message_id': message_id,
@@ -530,8 +512,9 @@ async def pipeline_worker():
                 chat_id = message['chat_id']
                 message_id = message['message_id']
                 message_type = message['type']
+                bot_type = message.get('bot_type', 'search_intelligence_bot')  # По умолчанию
                 torch.xpu.synchronize()
-                logger.info(f"PIPELINE_WORKER-------------->{message_type}")
+                logger.info(f"PIPELINE_WORKER-------------->{message_type} from {bot_type}")
                 
                 # Инициализация переменных
                 text = None
@@ -541,18 +524,18 @@ async def pipeline_worker():
                 # Обработка входящих данных на основе типа сообщения
                 if message_type == 'text':
                     text = message['text']
-                    await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
+                    await send_status_update(bot_type, chat_id, message_id, "🔤 Анализ текста...")
                 elif message_type == 'voice':
                     audio_content = message['audio_content']
-                    await send_status_update(chat_id, message_id, "🎙️ Обработка голоса...")
+                    await send_status_update(bot_type, chat_id, message_id, "🎙️ Обработка голоса...")
                     result = whisper_pipe(audio_content)
                     torch.xpu.empty_cache()
                     text = result["text"]
-                    await send_status_update(chat_id, message_id, "🔤 Анализ текста...")
+                    await send_status_update(bot_type, chat_id, message_id, "🔤 Анализ текста...")
                 elif message_type == 'file':
                     text = message['text']
                 elif message_type == 'status_update_video':
-                    await send_status_update(chat_id, message_id, message["status"])
+                    await send_status_update(bot_type, chat_id, message_id, message["status"])
                     continue  # Переходим к следующей итерации цикла
                 elif message_type.startswith(('gen_voice')):
                     # Обрабатываем gen_voice отдельно - здесь уже есть текст для синтеза
@@ -561,10 +544,11 @@ async def pipeline_worker():
                 elif message_type.startswith(('gen_image')):
                     # Обрабатываем gen_voice отдельно - здесь уже есть текст для синтеза
                     text = message['text'] 
-                    await send_status_update(chat_id, message_id, "🖼️ Генерация изображения...")  
-                    output_image = await query_image_server_simple(text, chat_id, message_id)
-                    await send_gen_image(chat_id, message_id, output_image['images'])
+                    await send_status_update(bot_type, chat_id, message_id, "🖼️ Генерация изображения...")  
+                    # output_image = await query_image_server_simple(text, chat_id, message_id)
+                    # await send_gen_image(bot_type, chat_id, message_id, output_image['images'])
                     await sender.send(compress({
+                        'bot_type': bot_type,
                         'chat_id': chat_id,
                         'message_id': message_id,
                         'type': 'stop_typing_action',
@@ -573,25 +557,14 @@ async def pipeline_worker():
                 elif message_type == 'ocr':
                     # Обработка OCR запроса
                     file_id = message['file_id']
-                    #await send_status_update(chat_id, message_id, "📖 Распознавание текста...")
+                    #await send_status_update(bot_type, chat_id, message_id, "📖 Распознавание текста...")
                     extracted_text = await query_ocr_server(message['user_id'], chat_id, message_id, file_id)
                     print ("бработка OCR запроса----->", extracted_text)
                     if extracted_text:
-#                        await sender.send(compress({
-#                            'chat_id': chat_id,
-#                            'text': f"📖 Распознанный текст:\n\n{extracted_text}",
-#                            'message_id': message_id,
-#                            'type': 'text'
-#                        }))
-#                        await sender.send(compress({
-#                            'chat_id': chat_id,
-#                            'text': f"📖 Распознавание текста...\n\nID задачи: {extracted_text}",
-#                            'message_id': message_id,
-#                            'type': 'text'
-#                        }))
-                        await send_status_update(chat_id, message_id, "📖 Распознавание текста...")
+                        await send_status_update(bot_type, chat_id, message_id, "📖 Распознавание текста...")
                     else:
                         await sender.send(compress({
+                            'bot_type': bot_type,
                             'chat_id': chat_id,
                             'text': "❌ Не удалось распознать текст",
                             'message_id': message_id,
@@ -614,7 +587,7 @@ async def pipeline_worker():
                     history.reverse()
                     messages = [{"role": role, "content": msg} for msg, role in history]
                     messages.append({"role": "user", "content": text})
-                    await send_status_update(chat_id, message_id, "🧠 Генерация ответа...")
+                    await send_status_update(bot_type, chat_id, message_id, "🧠 Генерация ответа...")
                     
                     output = await llm_server(messages) 
                     if output is None:
@@ -625,13 +598,14 @@ async def pipeline_worker():
                 # Обработка ответа в зависимости от типа сообщения
                 if message_type == 'voice':
                     if response:
-                        await process_voice_response(response, message_type, is_voice_input=True)
+                        await process_voice_response(bot_type, response, message_type, is_voice_input=True)
                 elif message_type.startswith(('gen_voice')):
                     if response:
-                        await process_voice_response(response, message_type, is_voice_input=False)
+                        await process_voice_response(bot_type, response, message_type, is_voice_input=False)
                 elif message_type == 'text':
                     if response:
                         await sender.send(compress({
+                            'bot_type': bot_type,
                             'chat_id': chat_id,
                             'text': response,
                             'message_id': message_id,
@@ -679,13 +653,13 @@ def get_code_block(generated_text):
     else:
         return None, -1
 
-async def delete_previous_menu(chat_id):
+async def delete_previous_menu(bot_token, chat_id):
     menu_data = redis_client.hgetall(f"{REDIS_MENU_PREFIX}{chat_id}")
     if menu_data:
         message_id = menu_data.get(b'message_id')
         if message_id:
             try:
-                await delete_message(chat_id, message_id.decode())
+                await delete_message(bot_token, chat_id, message_id.decode())
             except Exception as e:
                 logger.error(f"Error deleting menu: {e}")
         redis_client.delete(f"{REDIS_MENU_PREFIX}{chat_id}")
@@ -696,34 +670,30 @@ async def save_menu_state(chat_id, message_id, menu_type):
         "type": menu_type
     })
 
-
-class MessageHandler(tornado.web.RequestHandler):
-    def initialize(self, sender, send_message_func, typing_tasks):
+class BaseMessageHandler(tornado.web.RequestHandler):
+    def initialize(self, bot_type, sender, send_message_func, typing_tasks):
+        self.bot_type = bot_type
+        self.bot_token = BOT_TOKENS[bot_type]
         self.sender = sender
         self.send_message_func = send_message_func
         self.typing_tasks = typing_tasks
         self.task_monitor = asyncio.create_task(self.monitor_tasks())
         
-        
     async def post(self):
         try:
             data = json.loads(self.request.body)
-            print (data, self.request.path)
+            print(f"Received data for {self.bot_type}:", data)
             if 'message' in data:
                 message = data['message']
                 chat_id = message['chat']['id']
                 message_id = message["message_id"]
-                #bot_id = message["from"]
-                #print (message["from"]['username'])
-#{'update_id': 391959005, 'message': {'message_id': 392, 'from': {'id': 603789567, 'is_bot': False, 'first_name': 'Victor', 'username': 'naturalkind', 'language_code': 'ru'}, 'chat': {'id': 603789567, 'first_name': 'Victor', 'username': 'naturalkind', 'type': 'private'}, 'date': 1762455605, 'text': 'как дела?'}} HTTPServerRequest(protocol='https', host='178.158.131.41', method='POST', uri='/', version='HTTP/1.1', remote_ip='91.108.5.117')
-                
                 
                 if 'username' in message['from']:
-                    user_id =  message['from']['username']
+                    user_id = message['from']['username']
                 else:
                     user_id = message['from']['id'] 
                 ## Create a unique key for each user in each chat
-                unique_key = f"{chat_id}:{message_id}"
+                unique_key = f"{self.bot_type}:{chat_id}:{message_id}"
                          
                 ## Обработка сообщений...
                 if 'forward_from' in message:
@@ -741,6 +711,7 @@ class MessageHandler(tornado.web.RequestHandler):
                         # Отправляем задачу на OCR распознавание
                         await self.start_typing_action(message_id, chat_id)
                         await self.sender.send(compress({
+                            'bot_type': self.bot_type,
                             'chat_id': chat_id,
                             'user_id': user_id,
                             'file_id': telegram_photo['file_id'],
@@ -748,7 +719,7 @@ class MessageHandler(tornado.web.RequestHandler):
                             'type': 'ocr'
                         }))
                     else:
-                        await self.send_message_func(chat_id, message_id, "Пожалуйста, перешлите текстовое или голосовое сообщение")
+                        await self.send_message_func(self.bot_token, chat_id, message_id, "Пожалуйста, перешлите текстовое или голосовое сообщение", menu_mod=False)
                     return
 
                 if 'text' in message:
@@ -766,6 +737,7 @@ class MessageHandler(tornado.web.RequestHandler):
                     # Отправляем задачу на OCR распознавание
                     await self.start_typing_action(message_id, chat_id)
                     await self.sender.send(compress({
+                        'bot_type': self.bot_type,
                         'chat_id': chat_id,
                         'user_id': user_id,
                         'file_id': telegram_photo['file_id'],
@@ -777,19 +749,16 @@ class MessageHandler(tornado.web.RequestHandler):
                     await self.handle_audio_message(chat_id, user_id, message_id, message['audio']['file_id'])
                     
                 else:
-                    
-                    await self.send_message_func(chat_id, message_id, "Пожалуйста, отправьте текстовое сообщение, голосовое сообщение или текстовый файл", menu_mod=False)         
+                    await self.send_message_func(self.bot_token, chat_id, message_id, "Пожалуйста, отправьте текстовое сообщение, голосовое сообщение или текстовый файл", menu_mod=False)         
                                
-#            else:
             elif 'callback_query' in data:
-                bot_id = data['callback_query']['message']['from']['username']
                 callback_query = data.get('callback_query', {})
                 chat_id = callback_query.get('message', {}).get('chat', {}).get('id')
                 message_id = callback_query.get('message', {}).get('message_id')
                 user_id = callback_query.get('from', {}).get('username')
                 data = callback_query.get('data')
-                unique_key = f"{chat_id}:{message_id}"
-                print ("CALLBACK !!!!!!!!!>", data, user_id, bot_id)
+                unique_key = f"{self.bot_type}:{chat_id}:{message_id}"
+                print (f"CALLBACK for {self.bot_type} !!!!!!!!!>", data, user_id)
                 if data == 'about':
                     await self.send_about_message(chat_id)
                 elif data == 'help':
@@ -797,24 +766,22 @@ class MessageHandler(tornado.web.RequestHandler):
                 elif data == 'main_menu':
                     await self.send_start_menu(chat_id)
                 elif data == 'reset':
-                    #await self.stop_typing_action(unique_key)
                     await self.send_reset_message(chat_id, message_id)                
                 elif data == 'gen_video':
                     await self.send_gen_video_menu(chat_id, message_id)
                 elif data == 'menu_close':
-                    await menu_close(chat_id, message_id)
+                    await menu_close(self.bot_token, chat_id, message_id)
                 elif data.lower().startswith(('settings')):
                     print ("SETTTTT->>>>>")
                     # использльзавать голос пользователя
                     parts = data.split()
                     if len(parts) > 1:
-        #                #голос пользователя 
                         if parts[1].lower() == "user":
                             await self.handle_voice_selection(user_id, chat_id, message_id, "user")
                         elif parts[1].lower() == "neural": 
                             await self.handle_voice_selection(user_id, chat_id, message_id, "neural")                
                     else:        
-                        await self.send_settings_menu(chat_id, message_id, user_id)
+                        await self.send_settings_menu(chat_id, user_id, message_id)
                 elif data.startswith(('gen_voice')):
                     await self.start_typing_action(message_id, chat_id)
                     parts = data.split('_')[-1]
@@ -823,7 +790,8 @@ class MessageHandler(tornado.web.RequestHandler):
                     elif int(parts) == 1:
                         text = callback_query.get('message', {}).get('text', {})
                     # Отправить
-                    await sender.send(compress({
+                    await self.sender.send(compress({
+                        'bot_type': self.bot_type,
                         'chat_id': chat_id,
                         'user_id': user_id,
                         'text': text,
@@ -839,7 +807,8 @@ class MessageHandler(tornado.web.RequestHandler):
                         text = callback_query.get('message', {}).get('text', {})                   
                     
                     # Отправить на сервер генерации изображений
-                    await sender.send(compress({
+                    await self.sender.send(compress({
+                        'bot_type': self.bot_type,
                         'chat_id': chat_id,
                         'user_id': user_id,
                         'text': text,
@@ -848,25 +817,19 @@ class MessageHandler(tornado.web.RequestHandler):
                     }))                    
                     
                 ## Обязательно отправляем ответ на callback-запрос
-                url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
+                url = f"https://api.telegram.org/bot{self.bot_token}/answerCallbackQuery"
                 async with aiohttp.ClientSession() as session:
                     await session.post(url, json={
                         "callback_query_id": callback_query.get('id')
                     })
                 
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
+            logger.error(f"Error processing message for {self.bot_type}: {e}")
             await self.stop_typing_action(unique_key)
     
     async def send_gen_video_menu(self, chat_id, message_id):
-        """
-        Написать здесь функцию
-        предоставить выбор пользователю какую запись использовать
-        пользователя или сгенерированную
-        добавить изображение с лицом или выбрать из нескольких вариантов
-        """
         buttons = []
-        await edit_buttons(chat_id, message_id, buttons)
+        await edit_buttons(self.bot_token, chat_id, message_id, buttons)
         print ("-------------------->SEND_GEN_VIDEO_MENU")
 
     async def send_settings_menu(self, chat_id, user_id, message_id):
@@ -894,12 +857,11 @@ class MessageHandler(tornado.web.RequestHandler):
 
     async def handle_image_selection(self, chat_id, message_id, image_type):
         if image_type == "custom":
-            await self.send_message_func(chat_id, message_id, "Отправьте изображение")
+            await self.send_message_func(self.bot_token, chat_id, message_id, "Отправьте изображение")
             redis_client.set(f"image_mode:{chat_id}", "custom")
         else:
             redis_client.set(f"image_mode:{chat_id}", image_type)
-            await self.send_message_func(chat_id, message_id, f"Выбрано изображение: {image_type}")
-            
+            await self.send_message_func(self.bot_token, chat_id, message_id, f"Выбрано изображение: {image_type}")
             
     async def download_image(self, file_id: str, user_id: int) -> str:
         """
@@ -914,7 +876,7 @@ class MessageHandler(tornado.web.RequestHandler):
                 return None
 
             # 2. Формируем URL для скачивания
-            download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            download_url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
             
             # 3. Скачиваем файл
             async with aiohttp.ClientSession() as session:
@@ -952,12 +914,12 @@ class MessageHandler(tornado.web.RequestHandler):
         ADMIN_ID = "naturalkind"
         
         if user_id != ADMIN_ID:
-            await self.send_message_func(chat_id, message_id, "⚠️ Нет доступа администратора", menu_mod=False)
+            await self.send_message_func(self.bot_token, chat_id, message_id, "⚠️ Нет доступа администратора", menu_mod=False)
             return
             
         parts = text.split()
         if len(parts) != 2:
-            await self.send_message_func(chat_id, message_id, f"⚠️ Ошибка", menu_mod=False)
+            await self.send_message_func(self.bot_token, chat_id, message_id, f"⚠️ Ошибка", menu_mod=False)
         else:
             target_user = parts[1]
             # Set reset parameters based on command type
@@ -967,14 +929,14 @@ class MessageHandler(tornado.web.RequestHandler):
             }
             
             result = reset_word_limits(user_id=target_user, **reset_params)
-            await self.send_message_func(chat_id, message_id, f"✅ {result}", menu_mod=False)
+            await self.send_message_func(self.bot_token, chat_id, message_id, f"✅ {result}", menu_mod=False)
 
     async def handle_voice_selection(self, user_id, chat_id, message_id, voice_type):
         redis_client.set(f"voice_mode:{user_id}", voice_type)
-        await self.send_message_func(chat_id, message_id, f"✅ Выбран режим генерации голоса: {voice_type}", menu_mod=False)
+        await self.send_message_func(self.bot_token, chat_id, message_id, f"✅ Выбран режим генерации голоса: {voice_type}", menu_mod=False)
         
     async def handle_text_message(self, chat_id, user_id, message_id, text):
-        logger.info(f"Received message from user {user_id} in chat {chat_id}: {text[:50]}...")
+        logger.info(f"Received message from user {user_id} in chat {chat_id} for {self.bot_type}: {text[:50]}...")
 
         if text.lower() == '/start':
             await self.send_start_menu(chat_id)
@@ -982,7 +944,7 @@ class MessageHandler(tornado.web.RequestHandler):
             await self.send_help_message(chat_id, user_id)
         elif text.lower() == '/reset':
             response = reset_dialog(chat_id)
-            await self.send_message_func(chat_id, message_id, response, menu_mod=False)
+            await self.send_message_func(self.bot_token, chat_id, message_id, response, menu_mod=False)
         elif text.lower() == '/info':
             await self.send_about_message(chat_id)
         # Handle reset commands
@@ -993,7 +955,6 @@ class MessageHandler(tornado.web.RequestHandler):
             # использльзавать голос пользователя
             parts = text.split()
             if len(parts) > 1:
-#                #голос пользователя 
                 if parts[1].lower() == "user":
                     await self.handle_voice_selection(user_id, chat_id, message_id, "user")
                 elif parts[1].lower() == "neural": 
@@ -1011,15 +972,16 @@ class MessageHandler(tornado.web.RequestHandler):
                 f"• Генераций голоса за месяц: {monthly_}/{MONTHLY_WORD_LIMIT} слов\n"
                 f"• Генераций видео голосом: {voice_mode}\n"
             )
-            await self.send_message_func(chat_id, message_id, stats, menu_mod=False)            
+            await self.send_message_func(self.bot_token, chat_id, message_id, stats, menu_mod=False)            
             
         else:
             cached_response = get_cached_response(text)
             if cached_response:
-                await self.send_message_func(chat_id, message_id, cached_response.decode('utf-8'), menu_mod=True)
+                await self.send_message_func(self.bot_token, chat_id, message_id, cached_response.decode('utf-8'), menu_mod=True)
             else:
                 await self.start_typing_action(message_id, chat_id)
                 await self.sender.send(compress({
+                    'bot_type': self.bot_type,
                     'chat_id': chat_id,
                     'user_id': user_id,
                     'text': text,
@@ -1028,7 +990,7 @@ class MessageHandler(tornado.web.RequestHandler):
                 }))
 
     async def send_start_menu(self, chat_id):
-        await delete_previous_menu(chat_id)
+        await delete_previous_menu(self.bot_token, chat_id)
         
         try:
             image_path = 'robots-AI.jpg'
@@ -1050,7 +1012,7 @@ class MessageHandler(tornado.web.RequestHandler):
                 ]
             }))
 
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendPhoto"
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, data=data) as response:
                     if response.status == 200:
@@ -1059,7 +1021,7 @@ class MessageHandler(tornado.web.RequestHandler):
                         await save_menu_state(chat_id, message_id, 'main')
                         return True
         except Exception as e:
-            logger.error(f"Error sending start menu: {e}")
+            logger.error(f"Error sending start menu for {self.bot_type}: {e}")
         return False
 
     async def handle_voice_message(self, chat_id, user_id, message_id, file_id):
@@ -1074,6 +1036,7 @@ class MessageHandler(tornado.web.RequestHandler):
         audio.export(output_wav_path, format="wav")
                             
         await self.sender.send(compress({
+            'bot_type': self.bot_type,
             'chat_id': chat_id,
             'user_id': user_id,
             'audio_content': speaker_wav_data,
@@ -1093,6 +1056,7 @@ class MessageHandler(tornado.web.RequestHandler):
         audio.export(output_wav_path, format="wav")
                             
         await self.sender.send(compress({
+            'bot_type': self.bot_type,
             'chat_id': chat_id,
             'user_id': user_id,
             'audio_content': speaker_wav_data,
@@ -1110,6 +1074,7 @@ class MessageHandler(tornado.web.RequestHandler):
             file_content = await self.get_file_content(file_id)
             full_content = f"Caption: {caption}\n\nFile Content:\n{file_content}" if caption else file_content
             await self.sender.send(compress({
+                'bot_type': self.bot_type,
                 'chat_id': chat_id,
                 'user_id': user_id,
                 'text': full_content,
@@ -1117,14 +1082,14 @@ class MessageHandler(tornado.web.RequestHandler):
                 'type': 'file'
             }))
         else:
-            await self.send_message_func(chat_id, message_id, "Пожалуйста, отправьте текстовый файл (.txt, .py, .h, .cpp)", menu_mod=False)
+            await self.send_message_func(self.bot_token, chat_id, message_id, "Пожалуйста, отправьте текстовый файл (.txt, .py, .h, .cpp)", menu_mod=False)
 
     async def monitor_tasks(self):
         while True:
             all_tasks = asyncio.all_tasks()
             active_tasks = [task for task in all_tasks if not task.done()]
             
-            logging.info(f"Current active tasks: {len(active_tasks)}")
+            logging.info(f"Current active tasks for {self.bot_type}: {len(active_tasks)}")
             for task in active_tasks:
                 logging.info(f"Task: {task.get_name()}, State: {task._state}")
             await asyncio.sleep(5)  ## Мониторинг каждую минуту
@@ -1133,7 +1098,7 @@ class MessageHandler(tornado.web.RequestHandler):
         self.task_monitor.cancel()
 
     async def start_typing_action(self, message_id, chat_id):
-        unique_key = f"{chat_id}:{message_id}"
+        unique_key = f"{self.bot_type}:{chat_id}:{message_id}"
         await self.stop_typing_action(unique_key)
         self.typing_tasks[unique_key] = asyncio.create_task(
             self.continuous_typing_action(unique_key, chat_id),
@@ -1147,7 +1112,7 @@ class MessageHandler(tornado.web.RequestHandler):
                 task.cancel()
 
     async def continuous_typing_action(self, unique_key, chat_id):
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction"
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendChatAction"
         data = {
             "chat_id": chat_id,
             "action": "typing"
@@ -1157,7 +1122,7 @@ class MessageHandler(tornado.web.RequestHandler):
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=data) as response:
                         if response.status != 200:
-                            logger.error(f"Failed to send typing action. Status code: {response.status}")
+                            logger.error(f"Failed to send typing action for {self.bot_type}. Status code: {response.status}")
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             logger.info(f"Typing action cancelled for unique_key: {unique_key}")
@@ -1168,17 +1133,17 @@ class MessageHandler(tornado.web.RequestHandler):
 
     async def get_file_content(self, file_id, is_voice=False):
         file_path = await self.get_file_path(file_id)
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 if response.status == 200:
                     return await response.read() if is_voice else await response.text()
                 else:
-                    logger.error(f"Failed to get file content. Status code: {response.status}")
+                    logger.error(f"Failed to get file content for {self.bot_type}. Status code: {response.status}")
                     return None
 
     async def get_file_path(self, file_id):
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
+        url = f"https://api.telegram.org/bot{self.bot_token}/getFile"
         params = {'file_id': file_id}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params) as response:
@@ -1186,11 +1151,11 @@ class MessageHandler(tornado.web.RequestHandler):
                     file_info = await response.json()
                     return file_info['result']['file_path']
                 else:
-                    logger.error(f"Failed to get file path. Status code: {response.status}")
+                    logger.error(f"Failed to get file path for {self.bot_type}. Status code: {response.status}")
                     return None
 
     async def send_about_message(self, chat_id):
-        await delete_previous_menu(chat_id)
+        await delete_previous_menu(self.bot_token, chat_id)
         
         about_text = """
         🤖 *О боте*:
@@ -1216,7 +1181,7 @@ class MessageHandler(tornado.web.RequestHandler):
         - DeepSeek-OCR распознавание текста
         """
         
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         data = {
             "chat_id": chat_id,
             "text": about_text,
@@ -1240,7 +1205,7 @@ class MessageHandler(tornado.web.RequestHandler):
         await self.send_menu_message(chat_id, message_id, reset_response)
 
     async def send_help_message(self, chat_id, user_id):
-        await delete_previous_menu(chat_id)
+        await delete_previous_menu(self.bot_token, chat_id)
         
         voice_mode = redis_client.get(f"voice_mode:{user_id}") or b"neural"
         voice_mode = voice_mode.decode()
@@ -1263,7 +1228,7 @@ class MessageHandler(tornado.web.RequestHandler):
         *✅ Выбран голоса для генерации видео*: `{voice_mode}`
         """
         
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         data = {
             "chat_id": chat_id,
             "text": help_text,
@@ -1286,7 +1251,7 @@ class MessageHandler(tornado.web.RequestHandler):
         return False
 
     async def send_menu_message(self, chat_id, message_id, text, inline_keyboard = [[{"text": "📘 Инструкция", "callback_data": "help"}]]):
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         data = {
             "chat_id": chat_id,
             "text": text,
@@ -1299,9 +1264,15 @@ class MessageHandler(tornado.web.RequestHandler):
         async with aiohttp.ClientSession() as session:
             await session.post(url, json=data)
 
-# Остальные функции (send_message, send_voice, edit_buttons, menu_close, edit_message, delete_message, 
-# send_status_message, update_status_message, delete_status_message, process_responses) остаются без изменений
-# Альтернативная версия с использованием str.translate (более эффективная)
+# Конкретные обработчики для каждого бота
+class SearchIntelligenceHandler(BaseMessageHandler):
+    def initialize(self, sender, send_message_func, typing_tasks):
+        super().initialize('search_intelligence_bot', sender, send_message_func, typing_tasks)
+
+class NaturalAIHandler(BaseMessageHandler):
+    def initialize(self, sender, send_message_func, typing_tasks):
+        super().initialize('natural_ai_bot', sender, send_message_func, typing_tasks)
+
 # Временные маркеры для сохранения разметки
 import re
 def escape_markdown_v2(text: str) -> str:
@@ -1322,14 +1293,9 @@ def escape_markdown_v2(text: str) -> str:
     # Сохраняем жирный текст **text**
     bold_pattern = r'\*\*(.*?)\*\*'
     bold_matches = list(re.finditer(bold_pattern, text))
-#    
-#    # Сохраняем упоминания @username
-#    mention_pattern = r'(@\w+)'
-#    mention_matches = list(re.finditer(mention_pattern, text))
     
     # Временные замены
     temp_bold_marker = "🄱🄾🄻🄳🄼🄰🅁🄺🄴🅁"
-    temp_mention_marker = "🄼🄴🄽🅃🄸🄾🄽🄼🄰🅁🄺🄴🅁"
     
     # Заменяем жирный текст на временные маркеры
     bold_replacements = []
@@ -1337,13 +1303,6 @@ def escape_markdown_v2(text: str) -> str:
         original_text = match.group(1)
         bold_replacements.append(original_text)
         text = text.replace(match.group(0), f"{temp_bold_marker}{i}{temp_bold_marker}")
-    
-#    # Заменяем упоминания на временные маркеры
-#    mention_replacements = []
-#    for i, match in enumerate(mention_matches):
-#        original_text = match.group(1)
-#        mention_replacements.append(original_text)
-#        text = text.replace(match.group(0), f"{temp_mention_marker}{i}{temp_mention_marker}")
     
     # Экранируем весь текст
     escaped_text = ''
@@ -1364,13 +1323,9 @@ def escape_markdown_v2(text: str) -> str:
                 escaped_bold += char
         escaped_text = escaped_text.replace(f"{temp_bold_marker}{i}{temp_bold_marker}", f"**{escaped_bold}**")
     
-#    # Восстанавливаем упоминания
-#    for i, original_mention in enumerate(mention_replacements):
-#        escaped_text = escaped_text.replace(f"{temp_mention_marker}{i}{temp_mention_marker}", original_mention)
-    
     return escaped_text
 
-async def send_message(chat_id, message_id, text, typing_tasks, menu_mod):
+async def send_message(bot_token, chat_id, message_id, text, typing_tasks, menu_mod):
     print ("MENU_MOD =====>", menu_mod)
     code_block, code_start = get_code_block(text)
     
@@ -1378,8 +1333,9 @@ async def send_message(chat_id, message_id, text, typing_tasks, menu_mod):
     data = {
             "chat_id": chat_id,
             "reply_to_message_id": message_id, 
-            "parse_mode": "Markdown",   # "MarkdownV2"
+            "parse_mode": "Markdown",
     }
+    
     if menu_mod: 
         reply_markup = {
             "inline_keyboard": [
@@ -1421,15 +1377,8 @@ async def send_message(chat_id, message_id, text, typing_tasks, menu_mod):
     
     if len(text) <= 4096:
         print ("TEXT SEND TO TG !!!!!!!!!!!", escape_markdown_v2(text))
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        #data["text"] = text
-        data = {
-            "chat_id": chat_id,
-            "text": escape_markdown_v2(text),
-            "reply_to_message_id": message_id,
-            "parse_mode": "MarkdownV2", 
-            "reply_markup": json.dumps(reply_markup)
-        }
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data["text"] = escape_markdown_v2(text)
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=data) as response:
                 if response.status != 200:
@@ -1437,11 +1386,11 @@ async def send_message(chat_id, message_id, text, typing_tasks, menu_mod):
     else:
         ## Отправляем начало сообщения с кнопкой
         pre_text = text[:code_start] if 0 < code_start < 4096 else text[:50]
-        await send_message(chat_id, message_id, f"Ответ слишком большой: {pre_text}...", typing_tasks, menu_mod=True)
+        await send_message(bot_token, chat_id, message_id, f"Ответ слишком большой: {pre_text}...", typing_tasks, menu_mod=True)
         
         ## Отправляем файл
         file = StringIO(text)
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+        url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
         data = aiohttp.FormData()
         data.add_field('chat_id', str(chat_id))
         data.add_field('document', file, filename='response.txt')
@@ -1451,33 +1400,26 @@ async def send_message(chat_id, message_id, text, typing_tasks, menu_mod):
                 if response.status != 200:
                     logger.error(f"Failed to send document. Status code: {response.status}, Response: {await response.text()}")
 
-    unique_key = f"{chat_id}:{message_id}"
-    ## завершение отображение печати
-    if unique_key in typing_tasks:
-        typing_task = typing_tasks[unique_key]
-        del typing_tasks[unique_key]
-        if not typing_task.done():
-            typing_task.cancel()
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
+    # Extract bot_type from unique_key to stop typing action
+    for key in list(typing_tasks.keys()):
+        if f":{chat_id}:{message_id}" in key:
+            typing_task = typing_tasks[key]
+            del typing_tasks[key]
+            if not typing_task.done():
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
 
         
-async def send_voice(chat_id, message_id, audio_content, user_id):
-    ## Создаем разметку с кнопкой сброса
-#    reply_markup = {
-#        "inline_keyboard": [
-#            [{"text": "📹 Создать видео", "callback_data": "gen_video"}]
-#        ]
-#    }
+async def send_voice(bot_token, chat_id, message_id, audio_content, user_id):
     daily_, monthly_ = get_user_word_counts(user_id)
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVoice"
+    url = f"https://api.telegram.org/bot{bot_token}/sendVoice"
     data = aiohttp.FormData()
     data.add_field('chat_id', str(chat_id))
     data.add_field('reply_to_message_id', str(message_id))
     data.add_field('voice', audio_content, filename='voice.ogg', content_type='audio/ogg')
-    #data.add_field('reply_markup', json.dumps(reply_markup))
     data.add_field('caption', f"Сгенерировано {daily_} слов из доступных {DAILY_WORD_LIMIT} сегодня. Загрузите изображение с лицом человекоподобного существа для анимации")
     
     async with aiohttp.ClientSession() as session:
@@ -1485,19 +1427,14 @@ async def send_voice(chat_id, message_id, audio_content, user_id):
             if response.status != 200:
                 logger.error(f"Failed to send voice message. Status code: {response.status}")
 
-async def edit_buttons(chat_id, message_id, buttons):
+async def edit_buttons(bot_token, chat_id, message_id, buttons):
     buttons = {
         "inline_keyboard": [
-#            [{"text": "✅ Видео создано", "callback_data": "video_completed"}],
-#            [{"text": "🔄 Создать другое видео", "callback_data": "gen_video_again"}]
-#            [{"text": "📼 Сгенерированный голос", "callback_data": "select_voice"}, 
-#             {"text": "🎤 Голос пользователя", "callback_data": "select_voice"}],
-#            [{"text": "🖼️ Выбрать изображение", "callback_data": "select_image"}]
             [{"text": "❌ Закрыть", "callback_data": "menu_close"}],
         ]
     }    
     
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageReplyMarkup"
+    url = f"https://api.telegram.org/bot{bot_token}/editMessageReplyMarkup"
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -1509,14 +1446,14 @@ async def edit_buttons(chat_id, message_id, buttons):
             if response.status != 200:
                 logger.error(f"Failed to edit message. Status code: {response.status}")
 
-async def menu_close(chat_id, message_id):
+async def menu_close(bot_token, chat_id, message_id):
     buttons = {
         "inline_keyboard": [
             [{"text": "📹 Создать видео", "callback_data": "gen_video"}],
         ]
     }    
     
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageReplyMarkup"
+    url = f"https://api.telegram.org/bot{bot_token}/editMessageReplyMarkup"
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -1528,8 +1465,8 @@ async def menu_close(chat_id, message_id):
             if response.status != 200:
                 logger.error(f"Failed to edit message. Status code: {response.status}")
 
-async def edit_message(chat_id, message_id, new_text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+async def edit_message(bot_token, chat_id, message_id, new_text):
+    url = f"https://api.telegram.org/bot{bot_token}/editMessageText"
     data = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -1541,9 +1478,8 @@ async def edit_message(chat_id, message_id, new_text):
             if response.status != 200:
                 logger.error(f"Failed to edit message. Status code: {response.status}")
 
-
-async def delete_message(chat_id, message_id):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+async def delete_message(bot_token, chat_id, message_id):
+    url = f"https://api.telegram.org/bot{bot_token}/deleteMessage"
     data = {
         "chat_id": chat_id,
         "message_id": message_id
@@ -1553,8 +1489,8 @@ async def delete_message(chat_id, message_id):
             if response.status != 200:
                 logger.error(f"Failed to delete message. Status code: {response.status}")
 
-async def send_status_message(chat_id, reply_to_message_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+async def send_status_message(bot_token, chat_id, reply_to_message_id, text):
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = {
         "chat_id": chat_id,
         "text": text,
@@ -1569,19 +1505,21 @@ async def send_status_message(chat_id, reply_to_message_id, text):
                 return None
 
 status_messages = {}  # Словарь для хранения ID сообщений статуса
-async def update_status_message(chat_id, message_id, status):
-    if (chat_id, message_id) in status_messages:
-        status_message_id = status_messages[(chat_id, message_id)]
-        await edit_message(chat_id, status_message_id, status)
+async def update_status_message(bot_token, chat_id, message_id, status):
+    key = (bot_token, chat_id, message_id)
+    if key in status_messages:
+        status_message_id = status_messages[key]
+        await edit_message(bot_token, chat_id, status_message_id, status)
     else:
-        status_message_id = await send_status_message(chat_id, message_id, status)
-        status_messages[(chat_id, message_id)] = status_message_id
+        status_message_id = await send_status_message(bot_token, chat_id, message_id, status)
+        status_messages[key] = status_message_id
 
-async def delete_status_message(chat_id, message_id):
-    if (chat_id, message_id) in status_messages:
-        status_message_id = status_messages[(chat_id, message_id)]
-        await delete_message(chat_id, status_message_id)
-        del status_messages[(chat_id, message_id)]
+async def delete_status_message(bot_token, chat_id, message_id):
+    key = (bot_token, chat_id, message_id)
+    if key in status_messages:
+        status_message_id = status_messages[key]
+        await delete_message(bot_token, chat_id, status_message_id)
+        del status_messages[key]
 
 async def process_responses(receiver, send_message_func):
     while True:
@@ -1590,17 +1528,20 @@ async def process_responses(receiver, send_message_func):
             response = decompress(response)
             chat_id = response['chat_id']
             message_id = response['message_id']
-            print ("PROCESS_RESPONSES------>", response['type'])
+            bot_type = response.get('bot_type', 'search_intelligence_bot')
+            bot_token = BOT_TOKENS[bot_type]
+            
+            print (f"PROCESS_RESPONSES for {bot_type}------>", response['type'])
+            
             if response['type'] == 'status_update':
-                await update_status_message(chat_id, message_id, response['status'])
+                await update_status_message(bot_token, chat_id, message_id, response['status'])
             elif response['type'] == 'video_gen_done':
-                await delete_status_message(chat_id, message_id)
+                await delete_status_message(bot_token, chat_id, message_id)
             elif response['type'] == 'stop_typing_action':
                 processed_text = response['text']
-                await send_message_func(chat_id, message_id, processed_text, menu_mod="stop_typing_action")
-                await delete_status_message(chat_id, message_id)
+                await send_message_func(bot_token, chat_id, message_id, processed_text, menu_mod="stop_typing_action")
+                await delete_status_message(bot_token, chat_id, message_id)
                 
-#-------------------------------------------------                
             elif response['type'] == 'text':
                 processed_text = response['text']
                 input_type = response.get('type', 'text')
@@ -1608,8 +1549,8 @@ async def process_responses(receiver, send_message_func):
                 save_message_to_db(chat_id, processed_text, "assistant")
                 cache_response(processed_text, processed_text)
                 
-                await send_message_func(chat_id, message_id, processed_text, menu_mod=True)
-                await delete_status_message(chat_id, message_id)
+                await send_message_func(bot_token, chat_id, message_id, processed_text, menu_mod=True)
+                await delete_status_message(bot_token, chat_id, message_id)
 
             elif response['type'] == 'voice':
                 processed_text = response['text']
@@ -1618,69 +1559,50 @@ async def process_responses(receiver, send_message_func):
                 save_message_to_db(chat_id, processed_text, "assistant")
                 cache_response(processed_text, processed_text)
                 
-                await send_message_func(chat_id, message_id, processed_text, menu_mod="voice")
-                await delete_status_message(chat_id, message_id)            
+                await send_message_func(bot_token, chat_id, message_id, processed_text, menu_mod="voice")
+                await delete_status_message(bot_token, chat_id, message_id)            
                 audio = response['audio']
                 print ("--------------VOICE!!!")
-                await send_voice(chat_id, message_id, audio, response['user_id'])     
+                await send_voice(bot_token, chat_id, message_id, audio, response['user_id'])     
             elif response['type'] == 'process_voice':
                 processed_text = response['text']
-                await send_message_func(chat_id, message_id, processed_text, menu_mod=False)
-                await delete_status_message(chat_id, message_id)                
+                await send_message_func(bot_token, chat_id, message_id, processed_text, menu_mod=False)
+                await delete_status_message(bot_token, chat_id, message_id)                
             elif response['type'] == 'process_voice_response':
                 processed_text = response['text']
-                await send_message_func(chat_id, message_id, processed_text, menu_mod="process_voice_response")
-                await delete_status_message(chat_id, message_id)                              
+                await send_message_func(bot_token, chat_id, message_id, processed_text, menu_mod="process_voice_response")
+                await delete_status_message(bot_token, chat_id, message_id)                              
             elif response['type'] == 'gen_voice':
-                await delete_status_message(chat_id, message_id)
+                await delete_status_message(bot_token, chat_id, message_id)
                 audio = response['audio']
                 print ("--------------GEN VOICE!!!")
-                await send_voice(chat_id, message_id, audio, response['user_id']) 
+                await send_voice(bot_token, chat_id, message_id, audio, response['user_id']) 
                 ## завершение отображение печати
-                unique_key = f"{chat_id}:{message_id}"
-                if unique_key in typing_tasks:
-                    typing_task = typing_tasks[unique_key]
-                    del typing_tasks[unique_key]
-                    if not typing_task.done():
-                        typing_task.cancel()
-                        try:
-                            await typing_task
-                        except asyncio.CancelledError:
-                            pass 
+                for key in list(typing_tasks.keys()):
+                    if f":{chat_id}:{message_id}" in key:
+                        typing_task = typing_tasks[key]
+                        del typing_tasks[key]
+                        if not typing_task.done():
+                            typing_task.cancel()
+                            try:
+                                await typing_task
+                            except asyncio.CancelledError:
+                                pass 
             elif response['type'] == 'gen_image':    
                 print ("GEN_IMAGE---------------------->>>>>>>>>>>>>")                        
                             
-                            
-                                
             elif response['type'] == 'stop_typing_action_':
                 ## завершение отображение печати
-                unique_key = f"{chat_id}:{message_id}"
-                if unique_key in typing_tasks:
-                    typing_task = typing_tasks[unique_key]
-                    del typing_tasks[unique_key]
-                    if not typing_task.done():
-                        typing_task.cancel()
-                        try:
-                            await typing_task
-                        except asyncio.CancelledError:
-                            pass
-#-------------------------------------------------                
-                
-#            else:
-#                processed_text = response['text']
-#                input_type = response.get('type', 'text')
-#                
-#                save_message_to_db(chat_id, processed_text, "assistant")
-#                cache_response(processed_text, processed_text)
-#                
-#                await send_message_func(chat_id, message_id, processed_text, menu_mod=True)
-#                await delete_status_message(chat_id, message_id)
-
-#                if input_type == 'voice':
-#                    audio = response['audio']
-#                    print ("--------------VOICE!!!")
-#                    await send_voice(chat_id, message_id, audio)
-
+                for key in list(typing_tasks.keys()):
+                    if f":{chat_id}:{message_id}" in key:
+                        typing_task = typing_tasks[key]
+                        del typing_tasks[key]
+                        if not typing_task.done():
+                            typing_task.cancel()
+                            try:
+                                await typing_task
+                            except asyncio.CancelledError:
+                                pass
 
         except Exception as e:
             logger.error(f"Error processing response: {e}")
@@ -1722,18 +1644,18 @@ class UnifiedCallbackHandler:
             
             if status == 'completed':
                 video_url = urljoin('https://192.168.1.50:6000/', data['download_url'])
-                await self._send_video_to_telegram(chat_id, message_id, video_url)
+                # await self._send_video_to_telegram(chat_id, message_id, video_url)
                 await self._cleanup_task(task_id, chat_id, message_id, user_id)
                 update_gen_counts(user_id)
             else:
-                await update_status_message(chat_id, message_id, "Ошибка генерации видео")
+                await update_status_message(BOT_TOKENS['search_intelligence_bot'], chat_id, message_id, "Ошибка генерации видео")
                 await self._cleanup_task(task_id, chat_id, message_id, user_id)
                 
         except Exception as e:
             logger.error(f"Video callback error: {str(e)}")
 
-    async def _send_ocr_result(self, chat_id, message_id, extracted_text):
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async def _send_ocr_result(self, bot_token, chat_id, message_id, extracted_text):
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         inline_keyboard = [[{"text": "📘 Инструкция", "callback_data": "help"}]]
         data = {
             "chat_id": chat_id,
@@ -1746,6 +1668,7 @@ class UnifiedCallbackHandler:
         }
         async with aiohttp.ClientSession() as session:
             await session.post(url, json=data)    
+            
     async def _handle_ocr_callback(self, data: dict):
         """Обработчик OCR callback-ов"""
         print ("!!!!!!!!!!!!!!!!!!!!!!Обработчик OCR callback-ов")
@@ -1769,10 +1692,11 @@ class UnifiedCallbackHandler:
                 # СОХРАНЕНИЕ В БАЗУ ДАННЫХ - ДОБАВЛЕНО
                 save_message_to_db(chat_id, extracted_text, "assistant")
                 
-                await self._send_ocr_result(chat_id, message_id, extracted_text)
+                # Use the first bot token for OCR responses (you might want to store which bot initiated the request)
+                await self._send_ocr_result(BOT_TOKENS['search_intelligence_bot'], chat_id, message_id, extracted_text)
                 await self._cleanup_task(task_id, chat_id, message_id, user_id, task_type='ocr')
             else:
-                await update_status_message(chat_id, message_id, "Ошибка распознавания текста")
+                await update_status_message(BOT_TOKENS['search_intelligence_bot'], chat_id, message_id, "Ошибка распознавания текста")
                 await self._cleanup_task(task_id, chat_id, message_id, user_id, task_type='ocr')
                
         except Exception as e:
@@ -1783,21 +1707,21 @@ class UnifiedCallbackHandler:
         redis_key = f"{task_type}_task:{task_id}"
         redis_client.delete(redis_key)
         
-        unique_key = f"{chat_id}:{message_id}"
-        if unique_key in typing_tasks:
-            typing_task = typing_tasks[unique_key]
-            del typing_tasks[unique_key]
-            if not typing_task.done():
-                typing_task.cancel()
-                try:
-                    await typing_task
-                except asyncio.CancelledError:
-                    pass
+        # Clean up typing tasks for all bots for this chat/message
+        for key in list(typing_tasks.keys()):
+            if f":{chat_id}:{message_id}" in key:
+                typing_task = typing_tasks[key]
+                del typing_tasks[key]
+                if not typing_task.done():
+                    typing_task.cancel()
+                    try:
+                        await typing_task
+                    except asyncio.CancelledError:
+                        pass
         
-        await delete_status_message(chat_id, message_id)
+        # Use the first bot token for cleanup (you might want to store which bot initiated the request)
+        await delete_status_message(BOT_TOKENS['search_intelligence_bot'], chat_id, message_id)
 
-
-        
 class UniversalCallbackHandler(tornado.web.RequestHandler):
     def initialize(self, callback_handler):
         self.callback_handler = callback_handler
@@ -1818,8 +1742,6 @@ class UniversalCallbackHandler(tornado.web.RequestHandler):
             self.set_status(500)
             self.write({"error": str(e)})
 
-
-
 if __name__ == '__main__':
     mp.set_start_method('spawn')
     # Запуск сервера
@@ -1837,13 +1759,24 @@ if __name__ == '__main__':
     # Создание универсального обработчика
     callback_handler = UnifiedCallbackHandler(sender)
     
+    # Создаем общую функцию для отправки сообщений
+    def create_send_message_func(typing_tasks):
+        return lambda bot_token, chat_id, message_id, text, menu_mod=True: send_message(bot_token, chat_id, message_id, text, typing_tasks, menu_mod)
+    
+    send_message_func = create_send_message_func(typing_tasks)
+    
     application = tornado.web.Application([
-        (r'/', MessageHandler, dict(
+        (r'/search_intelligence_bot', SearchIntelligenceHandler, dict(
             sender=sender, 
-            send_message_func=lambda chat_id, message_id, text, menu_mod=True: send_message(chat_id, message_id, text, typing_tasks, menu_mod=menu_mod),
+            send_message_func=send_message_func,
             typing_tasks=typing_tasks
         )),
-        (r'/callback', UniversalCallbackHandler, dict(callback_handler=callback_handler)),  # Универсальный endpoint
+        (r'/natural_ai_bot', NaturalAIHandler, dict(
+            sender=sender, 
+            send_message_func=send_message_func,
+            typing_tasks=typing_tasks
+        )),
+        (r'/callback', UniversalCallbackHandler, dict(callback_handler=callback_handler)),
     ])
     
     http_server = tornado.httpserver.HTTPServer(
@@ -1856,8 +1789,8 @@ if __name__ == '__main__':
     )
     
     http_server.listen(8443)
-    logger.info("Server started on port 8443")
+    logger.info("Server started on port 8443 with support for two bots")
     
     io_loop = tornado.ioloop.IOLoop.current()
-    io_loop.add_callback(process_responses, receiver, lambda chat_id, message_id, text, menu_mod=True: send_message(chat_id, message_id, text, typing_tasks, menu_mod=menu_mod))
+    io_loop.add_callback(process_responses, receiver, send_message_func)
     io_loop.start()

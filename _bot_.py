@@ -5,7 +5,8 @@ import json
 # Загрузка данных конфигурации из JSON файла
 with open('config.bot', 'r') as json_file:
     data = json.load(json_file)
-BOT_TOKEN = data['BOT_TOKEN']
+BOT_TOKEN = data['SEARCH_INTELLIGENCE_BOT_TOKEN']
+#BOT_TOKEN = data['NATURAL_AI_BOT_TOKEN']
 
 class TelegramWebhookManager:
     def __init__(self, acc_key, public_certificate_path):
@@ -31,7 +32,8 @@ class TelegramWebhookManager:
 # Example usage:
 # Replace 'YOURPUBLIC.pem' with the path to your actual public certificate file
 telegram_manager = TelegramWebhookManager(BOT_TOKEN, "YOURPUBLIC.pem")
-webhook_url = "https://178.158.131.41:8443"
+#webhook_url = "https://178.158.131.41:8443/natural_ai_bot"
+webhook_url = "https://178.158.131.41:8443/search_intelligence_bot"
 
 print (telegram_manager.set_webhook(webhook_url))
 print (telegram_manager.get_webhook_info())
