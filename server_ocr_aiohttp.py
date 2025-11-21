@@ -200,6 +200,7 @@ async def handle_ocr(request: web.Request) -> web.Response:
         **file_paths,
         "params": params,
         "callback_url": data.get('callback_url'),
+        "bot_type": data.get('bot_type'),
         "app": request.app
     })
     
@@ -319,6 +320,7 @@ async def handle_download(request: web.Request) -> web.Response:
     return web.json_response({
         "task_id": task_id,
         "status": "completed",
+        "bot_type": task.get('bot_type', ''),
         "extracted_text": task.get('result', ''),
         "output_path": task.get('output_path', '')
     })
